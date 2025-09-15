@@ -1,0 +1,8 @@
+2025-01-03 14:37:23,032 - ERROR - [KEI] CSV load error attempt 1: No columns to parse from file
+2025-01-03 14:42:16,161 - ERROR - [IDEAFORGE] CSV load error attempt 1: No columns to parse from file
+2025-01-03 14:50:38,246 - WARNING - Logging with TimedRotatingFileHandler.
+2025-01-03 14:51:15,322 - ERROR - [REDINGTON] CSV load error attempt 1: No columns to parse from file
+2025-01-03 15:00:31,808 - ERROR - [LAOPALA] CSV load error attempt 1: No columns to parse from file
+2025-01-03 15:02:26,280 - ERROR - [UNOMINDA] CSV load error attempt 1: No columns to parse from file
+2025-01-03 15:04:04,941 - ERROR - [HINDOILEXP] CSV load error attempt 1: No columns to parse from file
+2025-01-03 15:04:15,540 - ERROR - [IXIGO] CSV load error attempt 1: No columns to parse from file

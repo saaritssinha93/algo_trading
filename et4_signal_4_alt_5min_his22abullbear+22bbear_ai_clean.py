@@ -1,0 +1,941 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Aug 23 23:17:25 2025
+
+@author: Saarit
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan  8 15:02:02 2025
+
+Author: Saarit
+
+Clean version + ML filter:
+- Detects intraday signals using CSV-fitted indicator ranges.
+- Loads per-ticker ML models (per_ticker_models.joblib) and OOF (oof_predictions.csv).
+- Computes a per-ticker probability threshold from OOF (max F1).
+- Emits a signal only if model PredProb >= per-ticker threshold.
+- Writes signals and appends first-per-ticker to papertrade CSV.
+
+Assumptions:
+- Indicators CSVs live under INDICATORS_DIR and contain standard columns.
+- ML models file was produced by the earlier “all-in-one” trainer.
+"""
+
+import os
+import sys
+import glob
+import json
+import signal
+import pytz
+import logging
+import traceback
+import threading
+from datetime import datetime, timedelta, time as dt_time
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from filelock import FileLock, Timeout
+from logging.handlers import TimedRotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- NEW: sklearn + joblib for ML inference ---
+import warnings
+import joblib
+
+# ---------------------------------------------
+# 1) Configuration & setup
+# ---------------------------------------------
+INDICATORS_DIR = "main_indicators_july_5min2"
+SIGNALS_DB     = "generated_signals_historical5minv4.json"
+ENTRIES_DIR    = "main_indicators_history_entries_5minv4"  # where day's detected signals are saved
+os.makedirs(INDICATORS_DIR, exist_ok=True)
+os.makedirs(ENTRIES_DIR, exist_ok=True)
+
+# --- NEW: ML assets (produced by the trainer script) ---
+OOF_PATH     = "oof_predictions.csv"
+MODELS_PATH  = "per_ticker_models.joblib"
+USE_ML_FILTER = True        # master switch — set False to ignore models
+GLOBAL_MIN_PROB = 0.50      # safety floor if OOF-derived threshold is too low
+GLOBAL_MAX_PROB = 0.90      # safety ceiling to avoid too-aggressive thresholds
+ML_SOFT_MARGIN_BEAR = 0.03  # from his22b: allows near-threshold Bear signals
+
+# --- 22b (alt) constraints ---
+FITTED_CSV_BEAR_ALT = "fitted_indicator_ranges_by_ticker20_80.csv"  # 22b-style constraints
+DETECTOR_BEAR_ALT_VOLREL_MIN = 0.95  # 22b relaxed participation gate
+
+india_tz = pytz.timezone("Asia/Kolkata")
+
+logger = logging.getLogger()
+logger.setLevel(logging.WARNING)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+file_handler = TimedRotatingFileHandler(
+    "logs\\signalnewn5minv4.log", when="M", interval=30, backupCount=5, delay=True
+)
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.WARNING)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+console_handler.setLevel(logging.WARNING)
+
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+logging.warning("Logging with TimedRotatingFileHandler.")
+print("Script start...")
+
+# Optional: change working directory if needed
+cwd = "C:\\Users\\Saarit\\OneDrive\\Desktop\\Trading\\et4\\trading_strategies_algo"
+try:
+    os.chdir(cwd)
+except Exception as e:
+    logger.error(f"Error changing directory: {e}")
+
+# ---------------------------------------------
+# 1b) Minimal replica of the model wrapper used when saving
+# ---------------------------------------------
+from dataclasses import dataclass
+from typing import Dict, Any, List
+
+@dataclass
+class PerTickerModel:
+    kind: str                   # "knn" or "constant"
+    pipeline: Any = None        # sklearn Pipeline for "knn"
+    const_p: float = None       # float for "constant"
+    features: List[str] = None
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        X = df.copy()
+        # ensure required columns exist in order
+        for c in self.features:
+            if c not in X.columns:
+                X[c] = np.nan
+        X = X[self.features]
+        if self.kind == "constant":
+            return np.full((len(X),), float(self.const_p), dtype=float)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            preds = self.pipeline.predict(X)
+        return np.clip(np.asarray(preds, dtype=float), 0.0, 1.0)
+
+# ---------------------------------------------
+# 1c) Load ML assets & build thresholds
+# ---------------------------------------------
+ML_MODELS: Dict[str, PerTickerModel] = {}
+ML_FEATURES: List[str] = []
+ML_THRESHOLDS: Dict[str, float] = {}
+
+def _best_threshold_from_oof(df_tkr: pd.DataFrame) -> float:
+    """Pick a threshold that maximizes F1 on OOF; robust fallbacks."""
+    if df_tkr.empty:
+        return GLOBAL_MIN_PROB
+    y = pd.to_numeric(df_tkr["HitTarget"], errors="coerce").fillna(0).astype(int).to_numpy()
+    p = pd.to_numeric(df_tkr["PredProb"], errors="coerce").fillna(0.0).to_numpy()
+    if np.unique(y).size < 2:
+        thr = float(np.clip(np.nanmean(p) if len(p) else GLOBAL_MIN_PROB,
+                            GLOBAL_MIN_PROB, GLOBAL_MAX_PROB))
+        return thr
+    qs = np.unique(np.quantile(p, np.linspace(0.10, 0.90, 17)))
+    grid = np.unique(np.concatenate([qs, np.linspace(0.3, 0.8, 11)]))
+    best_f1, best_t = -1.0, 0.5
+    for t in grid:
+        pred = (p >= t).astype(int)
+        tp = int(np.sum((pred == 1) & (y == 1)))
+        fp = int(np.sum((pred == 1) & (y == 0)))
+        fn = int(np.sum((pred == 0) & (y == 1)))
+        if tp + fp == 0 or tp + fn == 0:
+            f1 = 0.0
+        else:
+            prec = tp / (tp + fp)
+            rec  = tp / (tp + fn)
+            f1 = 0.0 if (prec + rec) == 0 else 2 * prec * rec / (prec + rec)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    best_t = float(np.clip(best_t, GLOBAL_MIN_PROB, GLOBAL_MAX_PROB))
+    return best_t
+
+def load_ml_assets():
+    global ML_MODELS, ML_FEATURES, ML_THRESHOLDS
+    if not USE_ML_FILTER:
+        print("[ML] ML filter disabled by config.")
+        return
+    # Load models
+    if os.path.exists(MODELS_PATH):
+        try:
+            payload = joblib.load(MODELS_PATH)
+            # payload = {"models": {ticker: PerTickerModel}, "features": [...]}
+            ML_MODELS = payload.get("models", {})
+            ML_FEATURES = payload.get("features", [])
+            print(f"[ML] Loaded models for {len(ML_MODELS)} tickers. Features: {len(ML_FEATURES)}")
+        except Exception as e:
+            print(f"[ML] Could not load models: {e}")
+            ML_MODELS = {}
+            ML_FEATURES = []
+    else:
+        print(f"[ML] Models file not found: {MODELS_PATH}")
+
+    # Load OOF & compute thresholds
+    if os.path.exists(OOF_PATH):
+        try:
+            oof = pd.read_csv(OOF_PATH)
+            if "Ticker" in oof.columns and "PredProb" in oof.columns and "HitTarget" in oof.columns:
+                oof["TickerKey"] = oof["Ticker"].astype(str).str.strip().str.upper()
+                for tkr, g in oof.groupby("TickerKey"):
+                    ML_THRESHOLDS[tkr] = _best_threshold_from_oof(g)
+                print(f"[ML] Derived thresholds for {len(ML_THRESHOLDS)} tickers "
+                      f"(range: {min(ML_THRESHOLDS.values()):.2f}-{max(ML_THRESHOLDS.values()):.2f})")
+            else:
+                print("[ML] OOF missing required columns; skipping thresholds.")
+        except Exception as e:
+            print(f"[ML] Could not read OOF: {e}")
+    else:
+        print(f"[ML] OOF file not found: {OOF_PATH}")
+
+# Load ML on import
+load_ml_assets()
+
+# ---------------------------------------------
+# 2) Small utilities: signal DB, time parsing, CSV loading
+# ---------------------------------------------
+def load_generated_signals() -> set:
+    """Load the set of Signal_IDs we've already produced, to avoid duplicates."""
+    if os.path.exists(SIGNALS_DB):
+        try:
+            with open(SIGNALS_DB, "r") as f:
+                return set(json.load(f))
+        except json.JSONDecodeError:
+            logging.error("Signals DB JSON is corrupted. Starting with empty set.")
+    return set()
+
+def save_generated_signals(generated_signals: set) -> None:
+    """Persist the set of Signal_IDs."""
+    with open(SIGNALS_DB, "w") as f:
+        json.dump(list(generated_signals), f, indent=2)
+
+def normalize_time(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.DataFrame:
+    d = df.copy()
+    if "date" not in d.columns:
+        raise KeyError("DataFrame missing 'date' column.")
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d.dropna(subset=["date"], inplace=True)
+    if d["date"].dt.tz is None:
+        d["date"] = d["date"].dt.tz_localize(tz)
+    else:
+        d["date"] = d["date"].dt.tz_convert(tz)
+    d.sort_values("date", inplace=True)
+    d.reset_index(drop=True, inplace=True)
+    return d
+
+def load_and_normalize_csv(file_path: str, expected_cols=None, tz: str = "Asia/Kolkata") -> pd.DataFrame:
+    if not os.path.exists(file_path):
+        return pd.DataFrame(columns=expected_cols if expected_cols else [])
+    df = pd.read_csv(file_path)
+    if "date" in df.columns:
+        df = normalize_time(df, tz)
+    else:
+        if expected_cols:
+            for c in expected_cols:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[expected_cols]
+    return df
+
+# ---------------------------------------------
+# 3) Indicators (only what's needed): Session VWAP
+# ---------------------------------------------
+def calculate_session_vwap(
+    df: pd.DataFrame,
+    price_col: str = "close",
+    high_col: str = "high",
+    low_col: str = "low",
+    vol_col: str = "volume",
+    tz: str = "Asia/Kolkata",
+) -> pd.DataFrame:
+    d = df.copy()
+    dt = pd.to_datetime(d["date"], errors="coerce")
+    if dt.dt.tz is None:
+        dt = dt.dt.tz_localize(tz)
+    else:
+        dt = dt.dt.tz_convert(tz)
+    d["_session"] = dt.dt.date
+    tp = (d[high_col] + d[low_col] + d[price_col]) / 3.0
+    tp_vol = tp * d[vol_col]
+    d["_cum_tp_vol"] = tp_vol.groupby(d["_session"]).cumsum()
+    d["_cum_vol"] = d[vol_col].groupby(d["_session"]).cumsum()
+    d["VWAP"] = d["_cum_tp_vol"] / d["_cum_vol"]
+    d.drop(columns=["_session", "_cum_tp_vol", "_cum_vol"], inplace=True)
+    return d
+
+# ---------------------------------------------
+# 4) Signal detection (CSV ranges + optional ML filter)
+# ---------------------------------------------
+def detect_signals_in_memory(
+    ticker: str,
+    df_for_rolling: pd.DataFrame,
+    df_for_detection: pd.DataFrame,
+    existing_signal_ids: set,
+    fitted_csv_path: str = "fitted_indicator_ranges_by_ticker.csv",
+    volrel_window: int = 10,
+    volrel_min_periods: int = 10,
+    debug: bool = False,
+    volrel_gate_min: float = 1.10,
+    use_vwap_side_gate: bool = False,
+    vwap_long_min: float = 0.001,
+    vwap_short_max: float = -0.001,
+    # --- NEW: ML gating ---
+    use_ml_filter: bool = USE_ML_FILTER,
+    ml_models: Dict[str, PerTickerModel] = ML_MODELS,
+    ml_features: List[str] = ML_FEATURES,
+    ml_thresholds: Dict[str, float] = ML_THRESHOLDS,
+) -> list:
+    import ast
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime
+
+    signals = []
+    if df_for_detection.empty:
+        return signals
+
+    # ---- Load per-ticker fitted constraints from CSV ----
+    def _parse_range_cell(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return (np.nan, np.nan)
+        if isinstance(x, (list, tuple)) and len(x) == 2:
+            try:
+                return (float(x[0]), float(x[1]))
+            except Exception:
+                return (np.nan, np.nan)
+        s = str(x).strip()
+        if not s:
+            return (np.nan, np.nan)
+        try:
+            lo, hi = ast.literal_eval(s)
+            return (float(lo), float(hi))
+        except Exception:
+            s = s.strip("[]")
+            parts = [p for p in s.split(",") if p.strip() != ""]
+            if len(parts) == 2:
+                try:
+                    return (float(parts[0]), float(parts[1]))
+                except Exception:
+                    pass
+            return (np.nan, np.nan)
+
+    def _to_float(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return np.nan
+        try:
+            return float(x)
+        except Exception:
+            try:
+                return float(str(x).strip())
+            except Exception:
+                return np.nan
+
+    try:
+        cfg_df = pd.read_csv(fitted_csv_path)
+    except Exception as e:
+        print(f"[detect] Could not read '{fitted_csv_path}': {e}")
+        return signals
+
+    tkey = str(ticker).strip().upper()
+    if "Ticker" not in cfg_df.columns:
+        return signals
+    cfg_df = cfg_df.copy()
+    cfg_df["__TickerKey"] = cfg_df["Ticker"].astype(str).str.strip().str.upper()
+    cfg_df = cfg_df[cfg_df["__TickerKey"] == tkey]
+    if cfg_df.empty:
+        if debug: print(f"[detect:{ticker}] no per-ticker rows in fitted CSV.")
+        return signals
+
+    sides_raw = {}
+    for _, row in cfg_df.iterrows():
+        side = str(row.get("Side", "")).strip()
+        if side not in ("Bullish", "Bearish"):
+            continue
+        constraints = {}
+        for col in row.index:
+            if col in ("Ticker", "__TickerKey", "Side", "Samples_wins", "Quantiles_used"):
+                continue
+            if col.endswith("_range"):
+                constraints[col] = _parse_range_cell(row[col])
+            elif col.endswith("_min") or col.endswith("_max"):
+                constraints[col] = _to_float(row[col])
+        if constraints:
+            sides_raw[side] = constraints
+    if not sides_raw:
+        if debug: print(f"[detect:{ticker}] no constraints present after parse.")
+        return signals
+
+    # ---- Derived columns & rolling stats ----
+    combined = pd.concat([df_for_rolling, df_for_detection]).drop_duplicates()
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined.dropna(subset=["date"], inplace=True)
+    combined.sort_values("date", inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+    combined["date_only"] = combined["date"].dt.date
+
+    if "VWAP" not in combined.columns:
+        combined = calculate_session_vwap(combined)
+
+    if "rolling_vol_10" in combined.columns:
+        rv = combined["rolling_vol_10"]
+    elif "rolling_vol10" in combined.columns:
+        rv = combined["rolling_vol10"]; combined["rolling_vol_10"] = rv
+    else:
+        rv = combined["volume"].rolling(volrel_window, min_periods=volrel_min_periods).mean()
+        combined["rolling_vol_10"] = rv
+
+    eps = 1e-9
+    combined["StochD"] = combined.get("Stoch_%D", np.nan)
+    combined["StochK"] = combined.get("Stoch_%K", np.nan)
+    combined["VWAP_Dist"] = combined["close"] / combined["VWAP"] - 1.0
+    combined["EMA50_Dist"]  = (combined["close"] / combined["EMA_50"]  - 1.0) if "EMA_50"  in combined.columns else np.nan
+    combined["EMA200_Dist"] = (combined["close"] / combined["EMA_200"] - 1.0) if "EMA_200" in combined.columns else np.nan
+    combined["SMA20_Dist"]  = (combined["close"] / combined["20_SMA"]  - 1.0) if "20_SMA"  in combined.columns else np.nan
+    combined["VolRel"] = combined["volume"] / (combined["rolling_vol_10"] + eps)
+    combined["ATR_Pct"] = (combined["ATR"] / (combined["close"] + eps)) if "ATR" in combined.columns else np.nan
+    if {"Upper_Band", "Lower_Band"}.issubset(combined.columns):
+        bbw = (combined["Upper_Band"] - combined["Lower_Band"])
+        combined["BandWidth"] = bbw / (combined["close"] + eps)
+        combined["BBP"] = (combined["close"] - combined["Lower_Band"]) / (bbw + eps)
+    else:
+        combined["BandWidth"] = np.nan
+        combined["BBP"] = np.nan
+    if "OBV" in combined.columns:
+        obv_prev = combined["OBV"].shift(10)
+        combined["OBV_Slope10"] = (combined["OBV"] - obv_prev) / (obv_prev.abs() + eps)
+    else:
+        combined["OBV_Slope10"] = np.nan
+
+    colmap = {
+        "RSI":"RSI","ADX":"ADX","CCI":"CCI","MFI":"MFI","BBP":"BBP","BandWidth":"BandWidth","ATR_Pct":"ATR_Pct",
+        "StochD":"StochD","StochK":"StochK","MACD_Hist":"MACD_Hist","VWAP_Dist":"VWAP_Dist",
+        "Daily_Change":"Daily_Change","EMA50_Dist":"EMA50_Dist","EMA200_Dist":"EMA200_Dist",
+        "SMA20_Dist":"SMA20_Dist","OBV_Slope10":"OBV_Slope10","VolRel":"VolRel",
+    }
+    available_cols = set(combined.columns)
+
+    def _clean_constraints(raw: dict) -> dict:
+        cleaned = {}
+        for k, v in raw.items():
+            if k.endswith("_range"):
+                base = k[:-6]; col = colmap.get(base, base)
+                if col not in available_cols:
+                    continue
+                lo, hi = v if isinstance(v, (list, tuple)) and len(v) == 2 else (np.nan, np.nan)
+                if np.isnan(lo) or np.isnan(hi):
+                    continue
+                cleaned[k] = (float(lo), float(hi))
+            elif k.endswith("_min") or k.endswith("_max"):
+                base = k[:-4]; col = colmap.get(base, base)
+                if col not in available_cols:
+                    continue
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    continue
+                cleaned[k] = float(v)
+        return cleaned
+
+    sides = {side: _clean_constraints(raw) for side, raw in sides_raw.items()}
+
+    # --- Also load alt (22b-style) per-ticker constraints for union of bear entries ---
+    sides_b_raw = {}
+    try:
+        if not os.path.exists(FITTED_CSV_BEAR_ALT):
+            if debug:
+                print(f"[detect:{ticker}] ALT CSV not found: {FITTED_CSV_BEAR_ALT}")
+        cfg_df_b = pd.read_csv(FITTED_CSV_BEAR_ALT)
+        tkey_b = str(ticker).strip().upper()
+        if "Ticker" in cfg_df_b.columns:
+            cfg_df_b = cfg_df_b.copy()
+            cfg_df_b["__TickerKey"] = cfg_df_b["Ticker"].astype(str).str.strip().str.upper()
+            cfg_df_b = cfg_df_b[cfg_df_b["__TickerKey"] == tkey_b]
+            for _, row_b in cfg_df_b.iterrows():
+                side_b = str(row_b.get("Side", "")).strip()
+                if side_b not in ("Bullish", "Bearish"):
+                    continue
+                constraints_b = {}
+                for colb in row_b.index:
+                    if colb in ("Ticker", "__TickerKey", "Side", "Samples_wins", "Quantiles_used"):
+                        continue
+                    if colb.endswith("_range"):
+                        constraints_b[colb] = _parse_range_cell(row_b[colb])
+                    elif colb.endswith("_min") or colb.endswith("_max"):
+                        constraints_b[colb] = _to_float(row_b[colb])
+                if constraints_b:
+                    sides_b_raw.setdefault(side_b, {}).update(constraints_b)
+    except Exception as _e_alt:
+        if debug:
+            print(f"[detect:{ticker}] alt constraints load failed: {_e_alt}")
+
+    # CRITICAL: clean 22b constraints against available columns
+    sides_b = {side: _clean_constraints(raw) for side, raw in sides_b_raw.items()}
+
+    if debug:
+        print(f"[detect:{ticker}] 22b Bearish constraints kept: {len(sides_b.get('Bearish', {}))}")
+
+    if isinstance(sides_b, dict) and not sides_b.get("Bearish"):
+        if debug: print(f"[detect:{ticker}] alt Bearish constraints missing or empty; no 22b-style bears possible.")
+    if all(len(cfg) == 0 for cfg in sides.values()):
+        if debug: print(f"[detect:{ticker}] All constraints dropped.")
+        return signals
+
+    # --- ML helpers for this ticker ---
+    tkey = str(ticker).strip().upper()
+    model = ml_models.get(tkey)
+    p_thresh = ml_thresholds.get(tkey, GLOBAL_MIN_PROB)
+    have_ml = use_ml_filter and (model is not None) and (ml_features is not None) and len(ml_features) > 0
+
+    # Helper for index finder (align detect timestamps to nearest known row ≤ ts inside the same day)
+    def find_cidx(ts):
+        ts = pd.to_datetime(ts)
+        exact = combined.index[combined["date"] == ts]
+        if len(exact):
+            return int(exact[0])
+        d = ts.date()
+        mask = (combined["date_only"] == d) & (combined["date"] <= ts)
+        if mask.any():
+            return int(combined.index[mask][-1])
+        return None
+
+    def _check_side_constraints(row: pd.Series, side_constraints: dict) -> bool:
+        for k, rng in side_constraints.items():
+            if k.endswith("_range"):
+                base = k[:-6]; col = colmap.get(base, base)
+                x = row.get(col, np.nan); lo, hi = rng
+                if pd.isna(x) or not (lo <= x <= hi):
+                    return False
+        for k, thr in side_constraints.items():
+            if k.endswith("_min"):
+                base = k[:-4]; col = colmap.get(base, base)
+                x = row.get(col, np.nan)
+                if pd.isna(x) or not (x >= thr):
+                    return False
+        for k, thr in side_constraints.items():
+            if k.endswith("_max"):
+                base = k[:-4]; col = colmap.get(base, base)
+                x = row.get(col, np.nan)
+                if pd.isna(x) or not (x <= thr):
+                    return False
+        return True
+
+    # Evaluate detection slice
+    for _, row_det in df_for_detection.iterrows():
+        dt = row_det.get("date", None)
+        if pd.isna(dt):
+            continue
+
+        cidx = find_cidx(dt)
+        if cidx is None:
+            continue
+
+        r = combined.loc[cidx]
+
+        # Global participation brake -> make it a flag, not a hard continue
+        volrel_val = r.get("VolRel", np.nan)
+        volrel_ok_global = not (pd.isna(volrel_val) or volrel_val < volrel_gate_min)
+        # Primary 22a passes will require volrel_ok_global; extra 22b bears use relaxed gate.
+
+        # Optional side-aware VWAP gate
+        allow_bull = allow_bear = True
+        if use_vwap_side_gate:
+            vdist = r.get("VWAP_Dist", np.nan)
+            if pd.isna(vdist):
+                continue
+            if vdist < vwap_long_min:
+                allow_bull = False
+            if vdist > vwap_short_max:
+                allow_bear = False
+
+        # Build a one-row feature DF for ML scoring (if enabled)
+        one_row = None
+        ml_prob = None
+        if have_ml:
+            one_row = pd.DataFrame([{f: r.get(f, np.nan) for f in ml_features}])
+            try:
+                ml_prob = float(model.predict_proba(one_row)[0])
+            except Exception:
+                ml_prob = None
+
+        # ---- Bullish side (22a strict) ----
+        bull_cfg = sides.get("Bullish")
+        if bull_cfg and allow_bull and _check_side_constraints(r, bull_cfg):
+            if not volrel_ok_global:
+                pass  # skip primary bull due to global volrel gate
+            else:
+                # ML filter
+                if have_ml:
+                    if (ml_prob is None) or (ml_prob < p_thresh):
+                        pass  # reject by ML
+                    else:
+                        sid = f"{ticker}-{pd.to_datetime(dt).isoformat()}-BULL_CSV_FITTED_ML"
+                        if sid not in existing_signal_ids:
+                            signals.append({
+                                "Ticker": ticker, "date": dt, "Entry Type": "CSVFittedFilter+ML",
+                                "Trend Type": "Bullish", "Price": round(float(r.get("close", np.nan)), 2),
+                                "Signal_ID": sid, "logtime": row_det.get("logtime", datetime.now().isoformat()),
+                                "Entry Signal": "Yes", "ML_Prob": round(ml_prob, 4), "ML_Thresh": round(p_thresh, 4),
+                            })
+                            existing_signal_ids.add(sid)
+                else:
+                    sid = f"{ticker}-{pd.to_datetime(dt).isoformat()}-BULL_CSV_FITTED"
+                    if sid not in existing_signal_ids:
+                        signals.append({
+                            "Ticker": ticker, "date": dt, "Entry Type": "CSVFittedFilter",
+                            "Trend Type": "Bullish", "Price": round(float(r.get("close", np.nan)), 2),
+                            "Signal_ID": sid, "logtime": row_det.get("logtime", datetime.now().isoformat()),
+                            "Entry Signal": "Yes",
+                        })
+                        existing_signal_ids.add(sid)
+
+        # ---- Bearish side (22a strict) ----
+        bear_cfg = sides.get("Bearish")
+        if bear_cfg and allow_bear and _check_side_constraints(r, bear_cfg):
+            if not volrel_ok_global:
+                pass  # skip primary bear due to global volrel gate
+            else:
+                if have_ml:
+                    if (ml_prob is None) or (ml_prob + ML_SOFT_MARGIN_BEAR < p_thresh):
+                        pass
+                    else:
+                        sid = f"{ticker}-{pd.to_datetime(dt).isoformat()}-BEAR_CSV_FITTED_ML"
+                        if sid not in existing_signal_ids:
+                            signals.append({
+                                "Ticker": ticker, "date": dt, "Entry Type": "CSVFittedFilter+ML",
+                                "Trend Type": "Bearish", "Price": round(float(r.get("close", np.nan)), 2),
+                                "Signal_ID": sid, "logtime": row_det.get("logtime", datetime.now().isoformat()),
+                                "Entry Signal": "Yes", "ML_Prob": round(ml_prob, 4), "ML_Thresh": round(p_thresh, 4),
+                            })
+                            existing_signal_ids.add(sid)
+                else:
+                    sid = f"{ticker}-{pd.to_datetime(dt).isoformat()}-BEAR_CSV_FITTED"
+                    if sid not in existing_signal_ids:
+                        signals.append({
+                            "Ticker": ticker, "date": dt, "Entry Type": "CSVFittedFilter",
+                            "Trend Type": "Bearish", "Price": round(float(r.get("close", np.nan)), 2),
+                            "Signal_ID": sid, "logtime": row_det.get("logtime", datetime.now().isoformat()),
+                            "Entry Signal": "Yes",
+                        })
+                        existing_signal_ids.add(sid)
+
+        # ---- Bearish (22b-style union) ----
+        bear_cfg_b = sides_b.get("Bearish") if isinstance(sides_b, dict) else None
+        if bear_cfg_b and allow_bear:
+            # relaxed participation: allow NaN (early bars) or >= threshold
+            if pd.isna(volrel_val) or (volrel_val >= DETECTOR_BEAR_ALT_VOLREL_MIN):
+                if _check_side_constraints(r, bear_cfg_b):
+                    ok_ml_b = True
+                    if have_ml:
+                        if (ml_prob is None) or (ml_prob + ML_SOFT_MARGIN_BEAR < p_thresh):
+                            ok_ml_b = False
+                    if ok_ml_b:
+                        sid_b = f"{ticker}-{pd.to_datetime(dt).isoformat()}-BEAR_CSV_FITTED_PERM" + ("_ML" if have_ml else "")
+                        if sid_b not in existing_signal_ids:
+                            signals.append({
+                                "Ticker": ticker, "date": dt,
+                                "Entry Type": "CSVFittedFilter_PERMISSIVE" + ("+ML" if have_ml else ""),
+                                "Trend Type": "Bearish",
+                                "Price": round(float(r.get("close", np.nan)), 2),
+                                "Signal_ID": sid_b,
+                                "logtime": row_det.get("logtime", datetime.now().isoformat()),
+                                "Entry Signal": "Yes",
+                                "ML_Prob": (round(ml_prob, 4) if ml_prob is not None else np.nan),
+                                "ML_Thresh": round(p_thresh, 4) if have_ml else np.nan,
+                            })
+                            existing_signal_ids.add(sid_b)
+
+    return signals
+
+
+# ---------------------------------------------
+# 5) Mark signals in main CSV => CalcFlag='Yes'
+# ---------------------------------------------
+def mark_signals_in_main_csv(ticker: str, signals_list: list, main_path: str, tz_obj) -> None:
+    if not os.path.exists(main_path):
+        logging.warning(f"[{ticker}] => No file found: {main_path}. Skipping.")
+        return
+    lock_path = main_path + ".lock"
+    lock = FileLock(lock_path, timeout=10)
+    try:
+        with lock:
+            df_main = load_and_normalize_csv(main_path, expected_cols=["Signal_ID"], tz="Asia/Kolkata")
+            if df_main.empty:
+                logging.warning(f"[{ticker}] => main_indicators empty. Skipping.")
+                return
+            for col in ["Signal_ID", "Entry Signal", "CalcFlag", "logtime"]:
+                if col not in df_main.columns:
+                    df_main[col] = ""
+            signal_ids = [sig["Signal_ID"] for sig in signals_list if "Signal_ID" in sig]
+            if not signal_ids:
+                logging.info(f"[{ticker}] => No valid Signal_IDs to update.")
+                return
+            mask = df_main["Signal_ID"].isin(signal_ids)
+            if mask.any():
+                df_main.loc[mask, "Entry Signal"] = "Yes"
+                df_main.loc[mask, "CalcFlag"] = "Yes"
+                current_time_iso = datetime.now(tz_obj).isoformat()
+                df_main.loc[mask & (df_main["logtime"] == ""), "logtime"] = current_time_iso
+                df_main.sort_values("date", inplace=True)
+                df_main.to_csv(main_path, index=False)
+                logging.info(f"[{ticker}] => Set CalcFlag='Yes' for {mask.sum()} row(s).")
+            else:
+                logging.info(f"[{ticker}] => No matching Signal_IDs found to update.")
+    except Timeout:
+        logging.error(f"[{ticker}] => FileLock timeout for {main_path}.")
+    except Exception as e:
+        logging.error(f"[{ticker}] => Error marking signals: {e}")
+
+# ---------------------------------------------
+# 6) Detect signals for one trading date across all CSVs
+# ---------------------------------------------
+def find_price_action_entries_for_date(target_date: datetime.date) -> pd.DataFrame:
+    st = india_tz.localize(datetime.combine(target_date, dt_time(9, 25)))
+    et = india_tz.localize(datetime.combine(target_date, dt_time(15, 10)))
+
+    DETECTOR_VOLREL_WINDOW = 10
+    DETECTOR_VOLREL_MIN_PERIODS = 10
+    DETECTOR_DEBUG = False
+
+    pattern = os.path.join(INDICATORS_DIR, "*_main_indicators.csv")
+    files = glob.glob(pattern)
+    if not files:
+        logging.info("No indicator CSV files found.")
+        return pd.DataFrame()
+
+    existing_ids = load_generated_signals()
+    all_signals = []
+    lock = threading.Lock()
+
+    def process_file(file_path: str) -> list:
+        ticker = os.path.basename(file_path).replace("_main_indicators.csv", "").upper()
+        df_full = load_and_normalize_csv(file_path, tz="Asia/Kolkata")
+        if df_full.empty:
+            return []
+        df_today = df_full[(df_full["date"] >= st) & (df_full["date"] <= et)].copy()
+        if df_today.empty:
+            return []
+        new_signals = detect_signals_in_memory(
+            ticker=ticker,
+            df_for_rolling=df_full,
+            df_for_detection=df_today,
+            existing_signal_ids=existing_ids,
+            fitted_csv_path="fitted_indicator_ranges_by_ticker.csv",
+            volrel_window=DETECTOR_VOLREL_WINDOW,
+            volrel_min_periods=DETECTOR_VOLREL_MIN_PERIODS,
+            debug=DETECTOR_DEBUG,
+            use_ml_filter=USE_ML_FILTER,
+            ml_models=ML_MODELS,
+            ml_features=ML_FEATURES,
+            ml_thresholds=ML_THRESHOLDS,
+        )
+        if new_signals:
+            with lock:
+                for sig in new_signals:
+                    existing_ids.add(sig["Signal_ID"])
+            return new_signals
+        return []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(process_file, f): f for f in files}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {target_date}"):
+            try:
+                signals = fut.result()
+                if signals:
+                    all_signals.extend(signals)
+            except Exception as e:
+                logging.error(f"Error processing file {futures[fut]}: {e}")
+
+    save_generated_signals(existing_ids)
+
+    if not all_signals:
+        logging.info(f"No new signals detected for {target_date}.")
+        return pd.DataFrame()
+
+    signals_df = pd.DataFrame(all_signals).sort_values("date").reset_index(drop=True)
+    logging.info(f"Total new signals detected for {target_date}: {len(signals_df)}")
+    return signals_df
+
+# ---------------------------------------------
+# 7) Build papertrade CSV for a date (first signal per ticker)
+# ---------------------------------------------
+def create_papertrade_df(df_signals: pd.DataFrame, output_file: str, target_date) -> None:
+    if df_signals.empty:
+        print("[Papertrade] DataFrame is empty => no rows to add.")
+        return
+    df = normalize_time(df_signals, tz="Asia/Kolkata").sort_values("date")
+    start_dt = india_tz.localize(datetime.combine(target_date, dt_time(9, 25)))
+    end_dt   = india_tz.localize(datetime.combine(target_date, dt_time(15, 30)))
+    df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
+    if df.empty:
+        print("[Papertrade] No rows in [09:25 - 15:30].")
+        return
+    for col in ["Target Price", "Quantity", "Total value"]:
+        if col not in df.columns:
+            df[col] = ""
+    for idx, row in df.iterrows():
+        price = float(row.get("Price", 0) or 0)
+        trend = row.get("Trend Type", "")
+        if price <= 0:
+            continue
+        if trend == "Bullish":
+            target = price * 1.01
+        elif trend == "Bearish":
+            target = price * 0.99
+        else:
+            target = price
+        qty = int(100000 / price)
+        total_val = qty * price
+        df.at[idx, "Target Price"] = round(target, 2)
+        df.at[idx, "Quantity"] = qty
+        df.at[idx, "Total value"] = round(total_val, 2)
+    if "time" not in df.columns:
+        df["time"] = datetime.now(india_tz).strftime("%H:%M:%S")
+    else:
+        blank_mask = (df["time"].isna()) | (df["time"] == "")
+        if blank_mask.any():
+            df.loc[blank_mask, "time"] = datetime.now(india_tz).strftime("%H:%M:%S")
+    lock_path = output_file + ".lock"
+    lock = FileLock(lock_path, timeout=10)
+    with lock:
+        if os.path.exists(output_file):
+            existing = normalize_time(pd.read_csv(output_file), tz="Asia/Kolkata")
+            existing_keys = set((erow["Ticker"], erow["date"].date()) for _, erow in existing.iterrows())
+            new_rows = []
+            # Prefer the highest ML_Prob per ticker for the day if present
+            if "ML_Prob" in df.columns:
+                df = df.sort_values(["Ticker","ML_Prob","date"], ascending=[True, False, True])
+            for tkr, g in df.groupby("Ticker"):
+                g = g.sort_values("date")
+                row = g.iloc[0]
+                key = (row["Ticker"], row["date"].date())
+                if key not in existing_keys:
+                    new_rows.append(row)
+            if not new_rows:
+                print("[Papertrade] No brand-new rows to append. All existing.")
+                return
+            new_df = pd.DataFrame(new_rows, columns=df.columns)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined.drop_duplicates(subset=["Ticker", "date"], keep="first", inplace=True)
+            combined.sort_values("date", inplace=True)
+            combined.to_csv(output_file, index=False)
+            print(f"[Papertrade] Appended => {output_file} with {len(new_rows)} new row(s).")
+        else:
+            # one-per-ticker; prefer highest ML_Prob if present
+            if "ML_Prob" in df.columns:
+                df = df.sort_values(["Ticker","ML_Prob","date"], ascending=[True, False, True])
+                df = df.groupby("Ticker", as_index=False).head(1)
+            else:
+                df.drop_duplicates(subset=["Ticker"], keep="first", inplace=True)
+            df.sort_values("date", inplace=True)
+            df.to_csv(output_file, index=False)
+            print(f"[Papertrade] Created => {output_file} with {len(df)} rows.")
+
+# ---------------------------------------------
+# 8) Orchestrator for a single date
+# ---------------------------------------------
+def run_for_date(date_str: str) -> None:
+    try:
+        target_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        date_label = target_day.strftime("%Y-%m-%d")
+        entries_file    = os.path.join(ENTRIES_DIR, f"{date_label}_entries.csv")
+        papertrade_file = f"papertrade_5min_v4_{date_label}.csv"
+        signals_df = find_price_action_entries_for_date(target_day)
+        if signals_df.empty:
+            logging.info(f"No signals found for {date_label}.")
+            pd.DataFrame().to_csv(entries_file, index=False)
+            return
+        signals_df.to_csv(entries_file, index=False)
+        print(f"[ENTRIES] Wrote {len(signals_df)} signals to {entries_file}")
+        for ticker, group in signals_df.groupby("Ticker"):
+            main_csv_path = os.path.join(INDICATORS_DIR, f"{ticker}_main_indicators.csv")
+            mark_signals_in_main_csv(ticker, group.to_dict("records"), main_csv_path, india_tz)
+        create_papertrade_df(signals_df, papertrade_file, target_day)
+        logging.info(f"Papertrade entries written to {papertrade_file}.")
+    except Exception as e:
+        logging.error(f"Error in run_for_date({date_str}): {e}")
+        logging.error(traceback.format_exc())
+
+# ---------------------------------------------
+# 9) Graceful shutdown handler
+# ---------------------------------------------
+def signal_handler(sig, frame):
+    print("Interrupt received, shutting down.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ---------------------------------------------
+# 10) Entry Point (Multiple Dates)
+# ---------------------------------------------
+if __name__ == "__main__":
+    date_args = sys.argv[1:]
+    if not date_args:
+        # Backfill calendar (example)
+        date_args = [
+            "2024-08-05","2024-08-06","2024-08-07","2024-08-08","2024-08-09",
+            "2024-08-12","2024-08-13","2024-08-14","2024-08-16",
+            "2024-08-19","2024-08-20","2024-08-21","2024-08-22","2024-08-23",
+            "2024-08-26","2024-08-27","2024-08-28","2024-08-29","2024-08-30",
+            "2024-09-02","2024-09-03","2024-09-04","2024-09-05","2024-09-06",
+            "2024-09-09","2024-09-10","2024-09-11","2024-09-12","2024-09-13",
+            "2024-09-16","2024-09-17","2024-09-18","2024-09-19","2024-09-20",
+            "2024-09-23","2024-09-24","2024-09-25","2024-09-26","2024-09-27",
+            "2024-09-30","2024-10-01","2024-10-03","2024-10-04","2024-10-07",
+            "2024-10-08","2024-10-09","2024-10-10","2024-10-11","2024-10-14",
+            "2024-10-15","2024-10-16","2024-10-17","2024-10-18","2024-10-21",
+            "2024-10-22","2024-10-23","2024-10-24","2024-10-25","2024-10-28",
+            "2024-10-29","2024-10-30","2024-10-31",
+            "2024-11-04","2024-11-05","2024-11-06","2024-11-07","2024-11-08",
+            "2024-11-11","2024-11-12","2024-11-13","2024-11-14","2024-11-18",
+            "2024-11-19","2024-11-20","2024-11-21","2024-11-22","2024-11-25",
+            "2024-11-26","2024-11-27","2024-11-28","2024-11-29",
+            "2024-12-02","2024-12-03","2024-12-04","2024-12-05","2024-12-06",
+            "2024-12-09","2024-12-10","2024-12-11","2024-12-12","2024-12-13",
+            "2024-12-16","2024-12-17","2024-12-18","2024-12-19","2024-12-20",
+            "2024-12-23","2024-12-24","2024-12-26","2024-12-27","2024-12-30",
+            "2024-12-31","2025-01-01","2025-01-02","2025-01-03","2025-01-06",
+            "2025-01-07","2025-01-08","2025-01-09","2025-01-10","2025-01-13",
+            "2025-01-14","2025-01-15","2025-01-16","2025-01-17","2025-01-20",
+            "2025-01-21","2025-01-22","2025-01-23","2025-01-24","2025-01-27",
+            "2025-01-28","2025-01-29","2025-01-30","2025-01-31","2025-02-03",
+            "2025-02-04","2025-02-05","2025-02-06","2025-02-07","2025-02-10",
+            "2025-02-11","2025-02-12","2025-02-13","2025-02-14","2025-02-17",
+            "2025-02-18","2025-02-19","2025-02-20","2025-02-21","2025-02-24",
+            "2025-02-25","2025-02-26","2025-02-27","2025-02-28",
+            "2025-03-03","2025-03-04","2025-03-05","2025-03-06","2025-03-07",
+            "2025-03-10","2025-03-11","2025-03-12","2025-03-13","2025-03-17",
+            "2025-03-18","2025-03-19","2025-03-20","2025-03-21","2025-03-24",
+            "2025-03-25","2025-03-26","2025-03-27","2025-03-28","2025-03-31",
+            "2025-04-01","2025-04-02","2025-04-03","2025-04-04","2025-04-07",
+            "2025-04-08","2025-04-09","2025-04-10","2025-04-14","2025-04-15",
+            "2025-04-16","2025-04-17","2025-04-18","2025-04-21","2025-04-22",
+            "2025-04-23","2025-04-24","2025-04-25","2025-04-28","2025-04-29",
+            "2025-04-30","2025-05-02","2025-05-05","2025-05-06","2025-05-07",
+            "2025-05-08","2025-05-09","2025-05-12","2025-05-13","2025-05-14",
+            "2025-05-15","2025-05-16","2025-05-19","2025-05-20","2025-05-21",
+            "2025-05-22","2025-05-23","2025-05-26","2025-05-27","2025-05-28",
+            "2025-05-29","2025-05-30","2025-06-02","2025-06-03","2025-06-04",
+            "2025-06-05","2025-06-06","2025-06-09","2025-06-10","2025-06-11",
+            "2025-06-12","2025-06-13","2025-06-16","2025-06-17","2025-06-18",
+            "2025-06-19","2025-06-20","2025-06-23","2025-06-24","2025-06-25",
+            "2025-06-26","2025-06-27","2025-06-30",
+            # July 2025
+            "2025-07-01","2025-07-02","2025-07-03","2025-07-04","2025-07-07","2025-07-08","2025-07-09","2025-07-10",
+            "2025-07-11","2025-07-14","2025-07-15","2025-07-16","2025-07-17","2025-07-18","2025-07-21","2025-07-22",
+            "2025-07-23","2025-07-24","2025-07-25","2025-07-28","2025-07-29","2025-07-30","2025-07-31"
+
+            # August 2025
+            "2025-08-01","2025-08-04","2025-08-05","2025-08-06","2025-08-07","2025-08-08","2025-08-11","2025-08-12",
+            "2025-08-13","2025-08-14","2025-08-18","2025-08-19","2025-08-20","2025-08-21","2025-08-22","2025-08-25",
+            "2025-08-26","2025-08-28","2025-08-29"
+        ]
+    for dstr in date_args:
+        print(f"\n=== Processing {dstr} ===")
+        run_for_date(dstr)

@@ -1,0 +1,14 @@
+# Ignore ALL directories (and everything inside them)
+**/
+
+# ---- your existing rules (keep) ----
+api_key.txt
+access_token.txt
+request_token.txt
+*.txt
+*.csv
+*.log
+*.log.log
+*.html
+data_cache
+__pycache__/

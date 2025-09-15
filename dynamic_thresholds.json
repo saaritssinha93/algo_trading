@@ -1,0 +1,22 @@
+{
+  "daily_impulse_long": 0.1961,
+  "daily_impulse_short": 0.155,
+  "change2min_long_low": -0.1709,
+  "change2min_long_high": 0.2021,
+  "change2min_short_low": -0.2626,
+  "change2min_short_high": -0.0,
+  "rsi_long_low": 33.3333,
+  "rsi_long_high": 72.093,
+  "rsi_short_low": 26.087,
+  "rsi_short_high": 64.1026,
+  "mfi_long_low": 20.7879,
+  "mfi_long_high": 83.403,
+  "mfi_short_low": 13.3766,
+  "mfi_short_high": 75.2788,
+  "vwap_diff_long_min": -0.5217,
+  "vwap_diff_short_min": 0.0787,
+  "fi_long_min": 30.58,
+  "fi_short_min": 23.1,
+  "adx_min": 35.3,
+  "volume_mult_min": 1.2121
+}

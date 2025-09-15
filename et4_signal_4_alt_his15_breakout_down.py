@@ -1,0 +1,1109 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan  8 15:02:02 2025
+
+@author: Saarit
+
+Solution B (modified for multiple user-specified back-dates):
+- Keep original detection data for papertrade CSV, only check CalcFlag='Yes' from main CSV.
+- daily_change uses previous day's close as the reference.
+- Only the *first* signal per ticker goes into papertrade CSV each day.
+- 'time' column is the actual detection time.
+- Allows you to run for a list of chosen dates (past or present) in one go.
+"""
+
+import os
+import logging
+import sys
+import glob
+import json
+import pytz
+import threading
+import traceback
+from datetime import datetime, timedelta, time as dt_time
+import pandas as pd
+from filelock import FileLock, Timeout
+from tqdm import tqdm
+from logging.handlers import TimedRotatingFileHandler
+import signal
+import numpy as np
+
+###########################################################
+# 1) Configuration & Setup
+###########################################################
+india_tz = pytz.timezone('Asia/Kolkata')
+# from et4_filtered_stocks_market_cap import selected_stocks
+from et4_filtered_stocks import selected_stocks  # Example import for your stock list
+
+CACHE_DIR = "data_cache"
+INDICATORS_DIR = "main_indicators_test"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(INDICATORS_DIR, exist_ok=True)
+
+logger = logging.getLogger()
+logger.setLevel(logging.WARNING)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+file_handler = TimedRotatingFileHandler(
+    "logs\\signal1.log",
+    when="M",
+    interval=30,
+    backupCount=5,
+    delay=True
+)
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.WARNING)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+console_handler.setLevel(logging.WARNING)
+
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+logging.warning("Logging with TimedRotatingFileHandler.")
+print("Script start...")
+
+# If needed, change to your working directory:
+cwd = r"C:\Users\Saarit\OneDrive\Desktop\Trading\et4\trading_strategies_algo"
+try:
+    os.chdir(cwd)
+except Exception as e:
+    logger.error(f"Error changing directory: {e}")
+
+# Removed any holiday/weekend logic; no more market_holidays or get_last_trading_day
+SIGNALS_DB = "generated_signals_historical2.json"
+
+
+###########################################################
+# 2) JSON-based Signal Tracking
+###########################################################
+def load_generated_signals():
+    if os.path.exists(SIGNALS_DB):
+        try:
+            with open(SIGNALS_DB, 'r') as f:
+                return set(json.load(f))
+        except json.JSONDecodeError:
+            logging.error("Signals DB JSON is corrupted. Starting with empty set.")
+            return set()
+    else:
+        return set()
+
+def save_generated_signals(generated_signals):
+    with open(SIGNALS_DB, 'w') as f:
+        json.dump(list(generated_signals), f, indent=2)
+
+
+###########################################################
+# 3) Time Normalization & CSV Loading
+###########################################################
+def normalize_time(df, tz='Asia/Kolkata'):
+    df = df.copy()
+    if 'date' not in df.columns:
+        raise KeyError("DataFrame missing 'date' column.")
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df.dropna(subset=['date'], inplace=True)
+
+    # If date is naive, localize to UTC first
+    if df['date'].dt.tz is None:
+        df['date'] = df['date'].dt.tz_localize('UTC')
+    df['date'] = df['date'].dt.tz_convert(tz)
+    return df
+
+def load_and_normalize_csv(file_path, expected_cols=None, tz='Asia/Kolkata'):
+    if not os.path.exists(file_path):
+        return pd.DataFrame(columns=expected_cols if expected_cols else [])
+
+    df = pd.read_csv(file_path)
+    if 'date' in df.columns:
+        df = normalize_time(df, tz)
+        df.sort_values('date', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+    else:
+        if expected_cols:
+            for c in expected_cols:
+                if c not in df.columns:
+                    df[c] = ""
+        if expected_cols:
+            df = df[expected_cols]
+    return df
+
+
+###########################################################
+# 4) Core Indicator Calculations (VWAP, Ichimoku, TTM Squeeze, etc.)
+###########################################################
+def calculate_vwap(df: pd.DataFrame, price_col='close', high_col='high', low_col='low', vol_col='volume') -> pd.DataFrame:
+    df['TP'] = (df[high_col] + df[low_col] + df[price_col]) / 3.0
+    df['cum_tp_vol'] = (df['TP'] * df[vol_col]).cumsum()
+    df['cum_vol'] = df[vol_col].cumsum()
+    df['VWAP'] = df['cum_tp_vol'] / df['cum_vol']
+    return df
+
+def calculate_vwap_bands(df: pd.DataFrame, vwap_col='VWAP', window=20, stdev_multiplier=2.0) -> pd.DataFrame:
+    rolling_diff = (df['close'] - df[vwap_col]).rolling(window)
+    df['vwap_std'] = rolling_diff.std()
+    df['VWAP_UpperBand'] = df[vwap_col] + stdev_multiplier * df['vwap_std']
+    df['VWAP_LowerBand'] = df[vwap_col] - stdev_multiplier * df['vwap_std']
+    return df
+
+def calculate_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
+    high_9 = df['high'].rolling(window=9).max()
+    low_9 = df['low'].rolling(window=9).min()
+    df['tenkan_sen'] = (high_9 + low_9) / 2
+
+    high_26 = df['high'].rolling(window=26).max()
+    low_26 = df['low'].rolling(window=26).min()
+    df['kijun_sen'] = (high_26 + low_26) / 2
+
+    df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
+
+    high_52 = df['high'].rolling(window=52).max()
+    low_52 = df['low'].rolling(window=52).min()
+    df['senkou_span_b'] = ((high_52 + low_52) / 2).shift(26)
+
+    df['chikou_span'] = df['close'].shift(-26)
+    return df
+
+def is_ichimoku_bullish(df: pd.DataFrame, idx: int, tol: float = 0.001) -> bool:
+    row = df.iloc[idx]
+    if pd.isna(row['senkou_span_a']) or pd.isna(row['senkou_span_b']):
+        return False
+    lower_span = min(row['senkou_span_a'], row['senkou_span_b'])
+    if row['close'] < lower_span * (1 - tol):
+        return False
+    if row['tenkan_sen'] < row['kijun_sen'] * (1 - tol):
+        return False
+    return True
+
+def is_ichimoku_bearish(df: pd.DataFrame, idx: int, tol: float = 0.001) -> bool:
+    row = df.iloc[idx]
+    if pd.isna(row['senkou_span_a']) or pd.isna(row['senkou_span_b']):
+        return False
+    higher_span = max(row['senkou_span_a'], row['senkou_span_b'])
+    if row['close'] > higher_span * (1 + tol):
+        return False
+    if row['tenkan_sen'] > row['kijun_sen'] * (1 + tol):
+        return False
+    return True
+
+def calculate_ttm_squeeze(df: pd.DataFrame, bb_window: int = 20, kc_window: int = 20, kc_mult: float = 1.5, tol: float = 0.5) -> pd.DataFrame:
+    # Bollinger Bands
+    df['mean_bb'] = df['close'].rolling(bb_window).mean()
+    df['std_bb'] = df['close'].rolling(bb_window).std()
+    df['upper_bb'] = df['mean_bb'] + 2 * df['std_bb']
+    df['lower_bb'] = df['mean_bb'] - 2 * df['std_bb']
+
+    # Keltner Channels
+    df['ema_kc'] = df['close'].ewm(span=kc_window).mean()
+    true_range = df['high'] - df['low']
+    df['atr_kc'] = true_range.rolling(kc_window).mean()
+    df['upper_kc'] = df['ema_kc'] + kc_mult * df['atr_kc']
+    df['lower_kc'] = df['ema_kc'] - kc_mult * df['atr_kc']
+
+    # Squeeze condition
+    df['squeeze_on'] = ((df['lower_bb'] > df['lower_kc'] * (1 - tol)) &
+                        (df['upper_bb'] < df['upper_kc'] * (1 + tol))).astype(int)
+    df['squeeze_release'] = 0
+    for i in range(1, len(df)):
+        if df['squeeze_on'].iloc[i-1] == 1 and df['squeeze_on'].iloc[i] == 0:
+            df.at[i, 'squeeze_release'] = 1
+    return df
+
+def is_squeeze_on(df: pd.DataFrame, idx: int) -> bool:
+    if 0 <= idx < len(df):
+        return df.at[idx, 'squeeze_on'] == 1
+    return False
+
+def is_squeeze_releasing(df: pd.DataFrame, idx: int) -> bool:
+    if 0 <= idx < len(df):
+        return df.at[idx, 'squeeze_release'] == 1
+    return False
+
+
+###########################################################
+# 5) Helper Candle/Consolidation Checks
+###########################################################
+def is_bullish_engulfing(df):
+    prev_open = df["open"].shift(1)
+    prev_close = df["close"].shift(1)
+    curr_open = df["open"]
+    curr_close = df["close"]
+    return (
+        (curr_close > curr_open) &
+        (prev_close < prev_open) &
+        (curr_open < prev_close) &
+        (curr_close > prev_open)
+    )
+
+def is_bearish_engulfing(df):
+    prev_open = df["open"].shift(1)
+    prev_close = df["close"].shift(1)
+    curr_open = df["open"]
+    curr_close = df["close"]
+    return (
+        (curr_close < curr_open) &
+        (prev_close > prev_open) &
+        (curr_open > prev_close) &
+        (curr_close < prev_open)
+    )
+
+
+
+def check_bullish_breakout_advanced(df, idx, volume_spike_mult=1.5):
+    if idx < 1:
+        return False
+    row = df.iloc[idx]
+    prev_row = df.iloc[idx - 1]
+    required_cols = ['VWAP', 'VWAP_UpperBand', 'volume', 'open', 'close']
+    for rc in required_cols:
+        if rc not in row:
+            return False
+    # VWAP slope check
+    if row['VWAP'] <= prev_row['VWAP']:
+        return False
+    # Price above VWAP
+    if row['close'] < row['VWAP']:
+        return False
+    # Some buffer above VWAP
+    if row['close'] < 1.05 * row['VWAP']:
+        return False
+    # Candle must be green
+    if row['close'] <= row['open']:
+        return False
+    # Must surpass upper band if it exists
+    if pd.notna(row['VWAP_UpperBand']) and row['close'] < row['VWAP_UpperBand']:
+        return False
+    vol_window = 10
+    if idx < vol_window:
+        return False
+    recent_avg_vol = df['volume'].iloc[idx - vol_window: idx].mean()
+    if row['volume'] < volume_spike_mult * recent_avg_vol:
+        return False
+    return True
+
+def check_bearish_breakdown_advanced(df, idx, volume_spike_mult=1.5):
+    if idx < 1:
+        return False
+    row = df.iloc[idx]
+    prev_row = df.iloc[idx - 1]
+    required_cols = ['VWAP', 'VWAP_LowerBand', 'volume', 'open', 'close']
+    for rc in required_cols:
+        if rc not in row:
+            return False
+    # VWAP slope check
+    if row['VWAP'] >= prev_row['VWAP']:
+        return False
+    # Price below VWAP
+    if row['close'] > row['VWAP']:
+        return False
+    # Some buffer below VWAP
+    if row['close'] > 0.95 * row['VWAP']:
+        return False
+    # Candle must be red
+    if row['close'] >= row['open']:
+        return False
+    # Must surpass lower band if it exists
+    if pd.notna(row['VWAP_LowerBand']) and row['close'] > row['VWAP_LowerBand']:
+        return False
+    vol_window = 10
+    if idx < vol_window:
+        return False
+    recent_avg_vol = df['volume'].iloc[idx - vol_window: idx].mean()
+    if row['volume'] < volume_spike_mult * recent_avg_vol:
+        return False
+    return True
+
+###########################################################
+# 1) Relaxed Consolidation Breakout/Breakdown
+###########################################################
+def is_bullish_breakout_consolidation(df, idx,
+                                      consolidation_period=8,       # was 10
+                                      volume_multiplier=1.2,        # was 1.5
+                                      range_threshold=0.03,         # was 0.02
+                                      breakout_buffer=0.005,        # was 0.01
+                                      min_body_ratio=0.20):         # was 0.25
+    """
+    Relaxed version of bullish breakout from a consolidation phase.
+    - consolidation_period is slightly shorter
+    - volume_multiplier is lower
+    - range_threshold is higher => we allow a bigger consolidation range
+    - breakout_buffer is smaller => we require a slightly smaller push beyond the range
+    - min_body_ratio is smaller => partial breakout candles with less body are allowed
+    """
+    if idx < consolidation_period or idx >= len(df):
+        return False
+
+    cdata = df.iloc[idx - consolidation_period: idx]
+    ch = cdata['high'].max()
+    cl = cdata['low'].min()
+    ac = cdata['close'].mean()
+
+    # Allow a wider "narrow range"
+    if (ch - cl) / ac > range_threshold:
+        return False
+
+    row = df.iloc[idx]
+    # Candle must be bullish
+    if row['close'] <= row['open']:
+        return False
+
+    rng = row['high'] - row['low']
+    if rng <= 0:
+        return False
+
+    body = row['close'] - row['open']
+    # Less strict body ratio
+    if body < min_body_ratio * rng:
+        return False
+
+    # Tighter breakout buffer => need to exceed (ch * (1 + breakout_buffer))
+    if row['close'] <= ch * (1 + breakout_buffer):
+        return False
+
+    if 'volume' in df.columns:
+        av = cdata['volume'].mean()
+        # Smaller volume multiplier => more trades triggered
+        if row['volume'] < volume_multiplier * av:
+            return False
+
+    return True
+
+
+def is_bearish_breakdown_consolidation(df, idx,
+                                       consolidation_period=8,       # was 10
+                                       volume_multiplier=1.2,        # was 1.5
+                                       range_threshold=0.03,         # was 0.02
+                                       breakdown_buffer=0.005,       # was 0.01
+                                       min_body_ratio=0.20):         # was 0.25
+    """
+    Relaxed version of bearish breakdown from a consolidation phase.
+    - Similar relaxed parameters as the bullish function
+    """
+    if idx < consolidation_period or idx >= len(df):
+        return False
+
+    cdata = df.iloc[idx - consolidation_period: idx]
+    ch = cdata['high'].max()
+    cl = cdata['low'].min()
+    ac = cdata['close'].mean()
+
+    # Slightly looser consolidation threshold
+    if (ch - cl) / ac > range_threshold:
+        return False
+
+    row = df.iloc[idx]
+    # Candle must be bearish
+    if row['close'] >= row['open']:
+        return False
+
+    rng = row['high'] - row['low']
+    if rng <= 0:
+        return False
+
+    body = row['open'] - row['close']
+    # Less strict body ratio
+    if body < min_body_ratio * rng:
+        return False
+
+    # Tighter breakdown buffer
+    if row['close'] >= cl * (1 - breakdown_buffer):
+        return False
+
+    if 'volume' in df.columns:
+        av = cdata['volume'].mean()
+        # Lower multiplier => more signals
+        if row['volume'] < volume_multiplier * av:
+            return False
+
+    return True
+
+
+###########################################################
+# 2) Relaxed Basic Breakout Checks
+###########################################################
+def check_bullish_breakout(daily_change: float,
+                           adx_val: float,
+                           price: float,
+                           high_10: float,
+                           vol: float,
+                           macd_val: float,
+                           roll_vol: float,
+                           macd_above_signal_now: bool,
+                           stoch_val: float,
+                           stoch_diff: float,
+                           slope_okay_for_bullish: bool,
+                           is_ich_bull: bool,
+                           vwap: float) -> bool:
+    """
+    Relaxed bullish breakout conditions:
+    - Wider daily_change range
+    - Looser ADX range
+    - Lower volume multiplier threshold
+    - Lower MACD threshold
+    - Etc.
+    """
+    def valid_adx_for_breakout(adx):
+        # Loosen ADX window from [25..45] to [20..50]
+        return 20 <= adx <= 50
+
+    return (
+        (1.0 <= daily_change <= 12.0)                  # was 2 to 10
+        and valid_adx_for_breakout(adx_val)            # was [25..45]
+        and (price >= 0.997 * high_10)                 # was 0.995
+        and (macd_val >= 3.0)                          # was 4.0
+        and (vol >= 1.5 * roll_vol)                    # was 2.0
+        and macd_above_signal_now
+        and (stoch_diff > 0)
+        and (stoch_val > 45)                           # was 50
+        and slope_okay_for_bullish
+        and is_ich_bull
+        and (price > vwap)
+    )
+
+
+def check_bearish_breakdown(daily_change: float,
+                            adx_val: float,
+                            price: float,
+                            low_10: float,
+                            vol: float,
+                            roll_vol: float,
+                            macd_val: float,
+                            macd_above_signal_now: bool,
+                            stoch_val: float,
+                            stoch_diff: float,
+                            slope_okay_for_bearish: bool,
+                            is_ich_bear: bool,
+                            vwap: float) -> bool:
+    """
+    Relaxed bearish breakdown conditions:
+    - Wider daily_change range
+    - Looser ADX range
+    - Lower volume multiplier threshold
+    - Lower MACD threshold
+    """
+    def valid_adx_for_breakout(adx):
+        return 20 <= adx <= 50  # was [25..45]
+
+    return (
+        (-12.0 <= daily_change <= -1.0)                # was -10 to -2
+        and valid_adx_for_breakout(adx_val)
+        and (price <= 1.003 * low_10)                  # was 1.005
+        and (vol >= 1.2 * roll_vol)                    # was 1.0
+        and (macd_val <= -3.0)                         # was -4.0
+        and (not macd_above_signal_now)
+        and (stoch_val < 50)
+        and (stoch_diff < 0)
+        and slope_okay_for_bearish
+        and is_ich_bear
+        and (price < vwap)
+    )
+
+###########################################################
+# 7) Additional Enhanced Strategy Conditions
+#    Add EMA slope checks, Bollinger Band expansion, etc.
+###########################################################
+
+def improved_bullish_breakout(combined: pd.DataFrame, idx: int) -> bool:
+    """
+    Returns True if the current row (at index idx) meets improved conditions for a bullish breakout.
+    Incorporates slopes of EMAs, Bollinger Band expansion, etc.
+    """
+    if idx < 1:
+        return False
+
+    r = combined.iloc[idx]
+    prev_r = combined.iloc[idx - 1]
+
+    # Basic conditions
+    cond1 = r['close'] > r['EMA_50'] and r['close'] > r['EMA_200']
+    cond2 = (r['tenkan_sen'] > r['kijun_sen']
+             and r['close'] > r['senkou_span_a']
+             and r['close'] > r['senkou_span_b'])
+    cond3 = r['RSI'] > 50
+    cond4 = (r['MACD'] - r['Signal_Line']) > 0  # MACD is above its signal
+    cond5 = r['ADX'] > 25
+    cond6 = (idx > 0 and r['OBV'] > prev_r['OBV']) if 'OBV' in combined.columns else True
+    cond7 = r['MFI'] > 50
+    cond8 = r['ROC'] > 0
+    cond9 = r['close'] > r['VWAP']
+
+    # Additional slope checks (e.g. EMA slope)
+    slope_ema_50 = r['EMA_50'] - prev_r['EMA_50'] if 'EMA_50' in r else 0
+    slope_ema_200= r['EMA_200'] - prev_r['EMA_200'] if 'EMA_200' in r else 0
+    cond_ema_slope = (slope_ema_50 > 0 and slope_ema_200 > 0)
+
+    # Bollinger Band expansion (BB_Width) check
+    cond_BB_expanding = True
+    if 'BB_Width' in r and idx > 0 and 'BB_Width' in prev_r:
+        cond_BB_expanding = (r['BB_Width'] > prev_r['BB_Width'])
+
+    return (cond1 and cond2 and cond3 and cond4 and cond5 and
+            cond6 and cond7 and cond8 and cond9 and
+            cond_ema_slope and cond_BB_expanding)
+
+def improved_bearish_breakdown(combined: pd.DataFrame, idx: int) -> bool:
+    """
+    Returns True if the current row (at index idx) meets improved conditions for a bearish breakdown.
+    Incorporates slopes of EMAs, Bollinger Band expansion, etc.
+    """
+    if idx < 1:
+        return False
+
+    r = combined.iloc[idx]
+    prev_r = combined.iloc[idx - 1]
+
+    # Basic conditions
+    cond1 = r['close'] < r['EMA_50'] and r['close'] < r['EMA_200']
+    cond2 = (r['tenkan_sen'] < r['kijun_sen']
+             and r['close'] < r['senkou_span_a']
+             and r['close'] < r['senkou_span_b'])
+    cond3 = r['RSI'] < 50
+    cond4 = (r['MACD'] - r['Signal_Line']) < 0  # MACD below its signal
+    cond5 = r['ADX'] > 25
+    cond6 = (idx > 0 and r['OBV'] < prev_r['OBV']) if 'OBV' in combined.columns else True
+    cond7 = r['MFI'] < 50
+    cond8 = r['ROC'] < 0
+    cond9 = r['close'] < r['VWAP']
+
+    # Additional slope checks (e.g. EMA slope)
+    slope_ema_50 = r['EMA_50'] - prev_r['EMA_50'] if 'EMA_50' in r else 0
+    slope_ema_200= r['EMA_200'] - prev_r['EMA_200'] if 'EMA_200' in r else 0
+    cond_ema_slope = (slope_ema_50 < 0 and slope_ema_200 < 0)
+
+    # Bollinger Band expansion (BB_Width) check
+    cond_BB_expanding = True
+    if 'BB_Width' in r and idx > 0 and 'BB_Width' in prev_r:
+        cond_BB_expanding = (r['BB_Width'] > prev_r['BB_Width'])
+
+    return (cond1 and cond2 and cond3 and cond4 and cond5 and
+            cond6 and cond7 and cond8 and cond9 and
+            cond_ema_slope and cond_BB_expanding)
+
+
+###########################################################
+# OPTIONAL: ATR-based Stop Loss & Target Example
+###########################################################
+def atr_sl_target(entry_price: float, trend_type: str, atr_val: float,
+                  stop_mult: float = 1.5, target_mult: float = 2.0) -> tuple:
+    """
+    Returns a (stop_loss, target) pair based on ATR multiples.
+    :param entry_price: The entry price of the instrument
+    :param trend_type: "Bullish" or "Bearish"
+    :param atr_val: The current ATR value (or an average ATR)
+    :param stop_mult: multiple of ATR used for Stop Loss
+    :param target_mult: multiple of ATR used for Target
+    """
+    if atr_val <= 0:
+        return (None, None)
+
+    if trend_type == "Bullish":
+        stop_loss = round(entry_price - stop_mult * atr_val, 2)
+        target    = round(entry_price + target_mult * atr_val, 2)
+    else:
+        # Bearish
+        stop_loss = round(entry_price + stop_mult * atr_val, 2)
+        target    = round(entry_price - target_mult * atr_val, 2)
+
+    return (stop_loss, target)
+
+
+###########################################################
+# 8) detect_signals_in_memory (Merged Detection Logic)
+#    Uses the 'Daily_Change' column from CSV directly.
+###########################################################
+def detect_signals_in_memory(
+    ticker: str,
+    df_for_rolling: pd.DataFrame,
+    df_for_detection: pd.DataFrame,
+    existing_signal_ids: set
+) -> list:
+    """
+    Runs the advanced detection logic on df_for_detection, using a combined DataFrame for continuity.
+    Returns a list of new signals, each with a unique 'Signal_ID'.
+    """
+    signals_detected = []
+    if df_for_detection.empty or df_for_rolling.empty:
+        return signals_detected
+
+    # Combine for indicator continuity and sort by date
+    combined = pd.concat([df_for_rolling, df_for_detection]).drop_duplicates()
+    combined.sort_values('date', inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+
+    # Ensure required indicators are available; these columns are expected from your main_indicators.csv
+    if 'VWAP' not in combined.columns:
+        combined = calculate_vwap(combined)
+    combined = calculate_vwap_bands(combined, 'VWAP', window=20, stdev_multiplier=2.0)
+    combined = calculate_ichimoku(combined)
+    combined = calculate_ttm_squeeze(combined)
+
+    # Rolling stats (e.g. highest high, lowest low, and average volume over a 10-bar window)
+    rolling_window = 10
+    combined['rolling_high_10'] = combined['high'].rolling(rolling_window, min_periods=rolling_window).max()
+    combined['rolling_low_10']  = combined['low'].rolling(rolling_window, min_periods=rolling_window).min()
+    combined['rolling_vol_10']  = combined['volume'].rolling(rolling_window, min_periods=rolling_window).mean()
+
+    # For momentum we use changes in Stochastic and 20_SMA slope (assumed precomputed)
+    combined['StochDiff']   = combined['Stochastic'].diff()
+    combined['SMA20_Slope'] = combined['20_SMA'].diff()
+
+    def slope_okay_for_bullish(row) -> bool:
+        s20 = row['SMA20_Slope']
+        s20ma = row['20_SMA']
+        if pd.isna(s20) or pd.isna(s20ma) or s20ma == 0:
+            return False
+        return (s20 > 0) and ((s20 / s20ma) >= 0.001)
+
+    def slope_okay_for_bearish(row) -> bool:
+        s20 = row['SMA20_Slope']
+        s20ma = row['20_SMA']
+        if pd.isna(s20) or pd.isna(s20ma) or s20ma == 0:
+            return False
+        return (s20 < 0) and (abs(s20) / s20ma >= 0.001)
+
+    def is_macd_above(ix: int) -> bool:
+        if 0 <= ix < len(combined):
+            m = combined.loc[ix, 'MACD']
+            s = combined.loc[ix, 'Signal_Line']
+            if pd.isna(m) or pd.isna(s):
+                return False
+            return (m > s)
+        return False
+
+    def is_adx_increasing(df_, cix, bars_ago=1):
+        si = cix - bars_ago
+        if si < 0:
+            return False
+        vals = df_.loc[si:cix, 'ADX'].to_numpy()
+        if any(pd.isna(v) for v in vals):
+            return False
+        return all(vals[i] < vals[i+1] for i in range(len(vals)-1))
+
+    def is_rsi_increasing(df_, cix, bars_ago=1):
+        si = cix - bars_ago
+        if si < 0:
+            return False
+        vals = df_.loc[si:cix, 'RSI'].to_numpy()
+        if any(pd.isna(v) for v in vals):
+            return False
+        return all(vals[i] < vals[i+1] for i in range(len(vals)-1))
+
+    def is_rsi_decreasing(df_, cix, bars_ago=1):
+        si = cix - bars_ago
+        if si < 0:
+            return False
+        vals = df_.loc[si:cix, 'RSI'].to_numpy()
+        if any(pd.isna(v) for v in vals):
+            return False
+        return all(vals[i] > vals[i+1] for i in range(len(vals)-1))
+
+    # Evaluate each row in df_for_detection
+    for idx_detect, row_detect in df_for_detection.iterrows():
+        dt = row_detect['date']
+
+        # Match the row in the combined DataFrame
+        match = combined[combined['date'] == dt]
+        if match.empty:
+            continue
+
+        cidx = match.index[0]
+        signals_for_this_bar = []
+
+        # Retrieve key parameters from the combined row
+        price = combined.loc[cidx, 'close']
+        vol   = combined.loc[cidx, 'volume']
+        high_10 = combined.loc[cidx, 'rolling_high_10']
+        low_10  = combined.loc[cidx, 'rolling_low_10']
+        roll_vol= combined.loc[cidx, 'rolling_vol_10']
+        stoch_val   = combined.loc[cidx, 'Stochastic']
+        stoch_diff  = combined.loc[cidx, 'StochDiff']
+        adx_val     = combined.loc[cidx, 'ADX']
+        macd_val    = combined.loc[cidx, 'MACD']
+        macd_above_signal_now = is_macd_above(cidx)
+        slope_bull  = slope_okay_for_bullish(combined.loc[cidx])
+        slope_bear  = slope_okay_for_bearish(combined.loc[cidx])
+        ich_bull    = is_ichimoku_bullish(combined, cidx)
+        ich_bear    = is_ichimoku_bearish(combined, cidx)
+        vwap        = combined.loc[cidx, 'VWAP']
+
+        # Retrieve daily change from the detection row (if missing, default to 0)
+        daily_change = row_detect.get('Daily_Change', np.nan)
+        if pd.isna(daily_change):
+            daily_change = 0.0
+
+        # We'll also fetch ATR if present for SL & target calculations
+        # Make sure your CSV has an ATR column if you want to use it.
+        atr_val = combined.loc[cidx, 'ATR'] if 'ATR' in combined.columns else 0.0
+
+        # ---- Improved Bullish Breakout Conditions ----
+        if (check_bullish_breakout(daily_change, adx_val, price, high_10, vol, macd_val, roll_vol,
+                                   macd_above_signal_now, stoch_val, stoch_diff, slope_bull, ich_bull, vwap) and
+            improved_bullish_breakout(combined, cidx) and
+            is_bullish_breakout_consolidation(combined, cidx) and
+            is_adx_increasing(combined, cidx, bars_ago=2) and
+            is_rsi_increasing(combined, cidx, bars_ago=1)):
+
+            signal_id = f"{ticker}-{dt.isoformat()}-BULL_BREAKOUT"
+            if signal_id not in existing_signal_ids:
+                # Example of setting SL and Target from ATR
+                stop_loss, target_px = atr_sl_target(price, "Bullish", atr_val,
+                                                     stop_mult=1.5, target_mult=2.0)
+                signals_for_this_bar.append({
+                    'Ticker': ticker,
+                    'date': dt,
+                    'Entry Type': 'Breakout',
+                    'Trend Type': 'Bullish',
+                    'Price': round(price, 2),
+                    'StopLoss': stop_loss,
+                    'Target Price': target_px,
+                    'Daily Change %': round(daily_change, 2),
+                    'VWAP': round(vwap, 2),
+                    'ADX': round(adx_val, 2) if adx_val else None,
+                    'MACD': round(macd_val, 2) if macd_val else None,
+                    'Signal_ID': signal_id,
+                    'logtime': row_detect.get("logtime", datetime.now().isoformat()),
+                    'Entry Signal': "Yes"
+                })
+
+        # ---- Improved Bearish Breakdown Conditions ----
+        if (check_bearish_breakdown(daily_change, adx_val, price, low_10, vol, roll_vol, macd_val,
+                                    macd_above_signal_now, stoch_val, stoch_diff, slope_bear, ich_bear, vwap) and 
+            improved_bearish_breakdown(combined, cidx) and
+            is_bearish_breakdown_consolidation(combined, cidx) and
+            is_adx_increasing(combined, cidx, bars_ago=2) and
+            is_rsi_decreasing(combined, cidx, bars_ago=1)):
+
+            signal_id = f"{ticker}-{dt.isoformat()}-BEAR_BREAKDOWN"
+            if signal_id not in existing_signal_ids:
+                stop_loss, target_px = atr_sl_target(price, "Bearish", atr_val,
+                                                     stop_mult=1.5, target_mult=2.0)
+                signals_for_this_bar.append({
+                    'Ticker': ticker,
+                    'date': dt,
+                    'Entry Type': 'Breakdown',
+                    'Trend Type': 'Bearish',
+                    'Price': round(price, 2),
+                    'StopLoss': stop_loss,
+                    'Target Price': target_px,
+                    'Daily Change %': round(daily_change, 2),
+                    'VWAP': round(vwap, 2),
+                    'ADX': round(adx_val, 2) if adx_val else None,
+                    'MACD': round(macd_val, 2) if macd_val else None,
+                    'Signal_ID': signal_id,
+                    'logtime': row_detect.get("logtime", datetime.now().isoformat()),
+                    'Entry Signal': "Yes"
+                })
+
+        for sig in signals_for_this_bar:
+            existing_signal_ids.add(sig["Signal_ID"])
+            signals_detected.append(sig)
+
+    return signals_detected
+
+
+##############################################################################
+# 9) Provide or Mock 'robust_prev_day_close_for_ticker' if needed
+##############################################################################
+def robust_prev_day_close_for_ticker(ticker: str, date_):
+    # You can implement your own logic here or remove if not needed
+    return None
+
+
+###########################################################
+# 10) Mark signals in main CSV => CalcFlag='Yes'
+###########################################################
+from filelock import FileLock, Timeout
+
+def mark_signals_in_main_csv(ticker, signals_list, main_path, tz_obj):
+    """
+    Updates 'main_indicators' CSV for a given ticker:
+      - Sets 'Entry Signal'='Yes' and 'CalcFlag'='Yes' for all matching Signal_IDs.
+    """
+    if not os.path.exists(main_path):
+        logging.warning(f"[{ticker}] => No file found: {main_path}. Skipping.")
+        return
+
+    lock_path = main_path + ".lock"
+    lock = FileLock(lock_path, timeout=10)
+
+    try:
+        with lock:
+            df_main = load_and_normalize_csv(main_path, expected_cols=["Signal_ID"], tz='Asia/Kolkata')
+            if df_main.empty:
+                logging.warning(f"[{ticker}] => main_indicators empty. Skipping.")
+                return
+
+            # Ensure required columns exist
+            required_cols = ["Signal_ID", "Entry Signal", "CalcFlag", "logtime"]
+            for col in required_cols:
+                if col not in df_main.columns:
+                    df_main[col] = ""
+
+            # Extract Signal_IDs from signals_list
+            signal_ids = [sig["Signal_ID"] for sig in signals_list if "Signal_ID" in sig]
+            if not signal_ids:
+                logging.info(f"[{ticker}] => No valid Signal_IDs to update.")
+                return
+
+            mask = df_main["Signal_ID"].isin(signal_ids)
+            rows_to_update = df_main[mask]
+
+            if not rows_to_update.empty:
+                df_main.loc[mask, ["Entry Signal", "CalcFlag"]] = "Yes"
+                current_time_iso = datetime.now(tz_obj).isoformat()
+                df_main.loc[mask & (df_main["logtime"] == ""), "logtime"] = current_time_iso
+
+                df_main.sort_values("date", inplace=True)
+                df_main.to_csv(main_path, index=False)
+                updated_count = mask.sum()
+                logging.info(f"[{ticker}] => Set CalcFlag='Yes' for {updated_count} row(s).")
+            else:
+                logging.info(f"[{ticker}] => No matching Signal_IDs found to update.")
+    except Timeout:
+        logging.error(f"[{ticker}] => FileLock timeout for {main_path}.")
+    except Exception as e:
+        logging.error(f"[{ticker}] => Error marking signals: {e}")
+
+
+###########################################################
+# 11) find_price_action_entries_for_date
+###########################################################
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def find_price_action_entries_for_date(target_date):
+    """
+    Detects and collects all new trading signals for the given date,
+    across all *_main_indicators.csv.
+    Intraday timeframe considered is 09:25 to 14:05 (example).
+    """
+    st = india_tz.localize(datetime.combine(target_date, dt_time(9, 25)))
+    et = india_tz.localize(datetime.combine(target_date, dt_time(14, 46)))
+
+    pattern = os.path.join(INDICATORS_DIR, '*_main_indicators.csv')
+    files = glob.glob(pattern)
+    if not files:
+        logging.info("No indicator CSV files found.")
+        return pd.DataFrame()
+
+    existing_ids = load_generated_signals()
+    all_signals = []
+    lock = threading.Lock()
+
+    def find_prev_day_close_for_ticker(df_full, trading_day):
+        """
+        Find the last close from the day BEFORE `trading_day`.
+        Return None if not found.
+        """
+        prev_day = trading_day - timedelta(days=1)
+        df_before = df_full[df_full['date'].dt.date < trading_day]
+        if df_before.empty:
+            return None
+        return df_before.iloc[-1]['close']
+
+    def process_file(file_path):
+        ticker = os.path.basename(file_path).replace('_main_indicators.csv', '').upper()
+        df_full = load_and_normalize_csv(file_path, tz='Asia/Kolkata')
+        if df_full.empty:
+            return []
+
+        # Only analyze the portion for our target_date
+        df_today = df_full[(df_full['date'] >= st) & (df_full['date'] <= et)].copy()
+
+        new_signals = detect_signals_in_memory(
+            ticker=ticker,
+            df_for_rolling=df_full,   # entire dataset for correct rolling(10)
+            df_for_detection=df_today, # final portion for new signals
+            existing_signal_ids=existing_ids
+        )
+
+        if new_signals:
+            with lock:
+                for sig in new_signals:
+                    existing_ids.add(sig["Signal_ID"])
+                return new_signals
+        return []
+
+    # ThreadPoolExecutor for parallel reading & detection
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_file = {executor.submit(process_file, file): file for file in files}
+        for future in tqdm(as_completed(future_to_file), total=len(future_to_file), desc=f"Processing {target_date}"):
+            file = future_to_file[future]
+            try:
+                signals = future.result()
+                if signals:
+                    all_signals.extend(signals)
+            except Exception as e:
+                logging.error(f"Error processing file {file}: {e}")
+
+    save_generated_signals(existing_ids)
+
+    if not all_signals:
+        logging.info(f"No new signals detected for {target_date}.")
+        return pd.DataFrame()
+
+    signals_df = pd.DataFrame(all_signals)
+    signals_df.sort_values('date', inplace=True)
+    signals_df.reset_index(drop=True, inplace=True)
+    logging.info(f"Total new signals detected for {target_date}: {len(signals_df)}")
+    return signals_df
+
+
+###########################################################
+# 12) create_papertrade_df => final CSV
+###########################################################
+def create_papertrade_df(df_entries_yes, output_file, target_date):
+    """
+    Takes a DataFrame of signals, ensures only *first* Ticker per day is appended,
+    then writes to the daily papertrade CSV with minimal duplication.
+    """
+    if df_entries_yes.empty:
+        print("[Papertrade] DataFrame is empty => no rows to add.")
+        return
+
+    df_entries_yes = normalize_time(df_entries_yes, tz='Asia/Kolkata')
+    df_entries_yes.sort_values('date', inplace=True)
+
+    # Example intraday timeframe for final filter
+    start_dt = india_tz.localize(datetime.combine(target_date, dt_time(9, 25)))
+    end_dt = india_tz.localize(datetime.combine(target_date, dt_time(17, 30)))
+    mask = (df_entries_yes['date'] >= start_dt) & (df_entries_yes['date'] <= end_dt)
+    df_entries_yes = df_entries_yes.loc[mask].copy()
+    if df_entries_yes.empty:
+        print("[Papertrade] No rows in [09:25 - 17:30].")
+        return
+
+    # Ensure columns for 'Target Price', 'Quantity', 'Total value'
+    for col in ["Target Price", "Quantity", "Total value"]:
+        if col not in df_entries_yes.columns:
+            df_entries_yes[col] = ""
+
+    # Simple example for target & quantity
+    for idx, row in df_entries_yes.iterrows():
+        price = float(row.get("Price", 0) or 0)
+        trend = row.get("Trend Type", "")
+        if price > 0:
+            if trend == "Bullish":
+                target = price * 1.01
+            elif trend == "Bearish":
+                target = price * 0.99
+            else:
+                target = price
+            qty = int(20000 / price)
+            total_val = qty * price
+
+            df_entries_yes.at[idx, "Target Price"] = round(target, 2)
+            df_entries_yes.at[idx, "Quantity"] = qty
+            df_entries_yes.at[idx, "Total value"] = round(total_val, 2)
+
+    # Set the 'time' column to the current detection time if missing
+    if 'time' not in df_entries_yes.columns:
+        df_entries_yes['time'] = datetime.now(india_tz).strftime('%H:%M:%S')
+    else:
+        blank_mask = (df_entries_yes['time'].isna()) | (df_entries_yes['time'] == "")
+        if blank_mask.any():
+            df_entries_yes.loc[blank_mask, 'time'] = datetime.now(india_tz).strftime('%H:%M:%S')
+
+    lock_path = output_file + ".lock"
+    lock = FileLock(lock_path, timeout=10)
+    with lock:
+        if os.path.exists(output_file):
+            existing = pd.read_csv(output_file)
+            existing = normalize_time(existing, tz='Asia/Kolkata')
+
+            existing_key_set = set()
+            for _, erow in existing.iterrows():
+                existing_key_set.add((erow['Ticker'], erow['date'].date()))
+
+            new_rows = []
+            for _, row in df_entries_yes.iterrows():
+                ticker = row['Ticker']
+                row_date_day = row['date'].date()
+                key = (ticker, row_date_day)
+                if key not in existing_key_set:
+                    new_rows.append(row)
+
+            if not new_rows:
+                print("[Papertrade] No brand-new rows to append. All existing.")
+                return
+
+            new_df = pd.DataFrame(new_rows, columns=df_entries_yes.columns)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined.drop_duplicates(subset=['Ticker', 'date'], keep='first', inplace=True)
+            combined.sort_values('date', inplace=True)
+            combined.to_csv(output_file, index=False)
+            print(f"[Papertrade] Appended => {output_file} with {len(new_rows)} new row(s).")
+        else:
+            df_entries_yes.drop_duplicates(subset=['Ticker'], keep='first', inplace=True)
+            df_entries_yes.sort_values('date', inplace=True)
+            df_entries_yes.to_csv(output_file, index=False)
+            print(f"[Papertrade] Created => {output_file} with {len(df_entries_yes)} rows.")
+
+###########################################################
+# 13) run_for_date(date_str) -- no weekend/holiday skip
+###########################################################
+def run_for_date(date_str):
+    """
+    Runs the detection & CSV updates for one specific date (YYYY-MM-DD),
+    with no weekend/holiday skipping.
+    """
+    try:
+        # Convert user-specified string to a date
+        requested_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+
+        # Force EXACT date instead of skipping weekends/holidays
+        last_trading_day = requested_date
+
+        date_label = last_trading_day.strftime('%Y-%m-%d')
+        papertrade_file = f"papertrade_{date_label}.csv"
+
+        # 1) Detect signals
+        raw_signals_df = find_price_action_entries_for_date(last_trading_day)
+        if raw_signals_df.empty:
+            logging.info(f"No signals found for {date_label}.")
+            return
+
+        # 2) Mark signals in main CSV
+        signals_grouped = raw_signals_df.groupby('Ticker')
+        for ticker, group in signals_grouped:
+            main_csv_path = os.path.join(INDICATORS_DIR, f"{ticker}_main_indicators.csv")
+            mark_signals_in_main_csv(ticker, group.to_dict('records'), main_csv_path, india_tz)
+
+        # 3) Append to papertrade CSV
+        create_papertrade_df(raw_signals_df, papertrade_file, last_trading_day)
+        logging.info(f"Papertrade entries written to {papertrade_file}.")
+
+    except Exception as e:
+        logging.error(f"Error in run_for_date({date_str}): {e}")
+        logging.error(traceback.format_exc())
+
+
+###########################################################
+# 14) Graceful Shutdown Handler
+###########################################################
+def signal_handler(sig, frame):
+    print("Interrupt received, shutting down.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+###########################################################
+# Entry Point (Multiple Dates)
+###########################################################
+if __name__ == "__main__":
+    # If multiple dates are provided on the command line, we'll iterate over them.
+    # Example usage:
+    date_args = sys.argv[1:]
+    if not date_args:
+        # If no args given, define a list of back-dates here:
+        date_args = [
+            "2025-03-12"
+        ]
+        # date_args = ["2025-02-04"]
+
+    for dstr in date_args:
+        print(f"\n=== Processing {dstr} ===")
+        run_for_date(dstr)
