@@ -71,7 +71,7 @@ def confirm_signal_with_llm(strategy_name, indicators_dict) -> bool:
     chat = ChatOpenAI(
         temperature=0,
         model_name="gpt-4",  # or "gpt-3.5-turbo" as needed
-        openai_api_key=""  # Replace with your actual API key
+        
     )
     template = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(system_prompt),
