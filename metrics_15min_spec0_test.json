@@ -1,0 +1,23 @@
+{
+  "n_trades": 7075,
+  "start": "2025-11-18 09:30:00+05:30",
+  "end": "2025-12-18 15:15:00+05:30",
+  "win_rate_pct": 51.39222614840989,
+  "avg_trade_pct": 0.08602230968369826,
+  "median_trade_pct": 0.03497484991075184,
+  "best_trade_pct": 1.8650640712119864,
+  "worst_trade_pct": -2.1879146919431265,
+  "avg_win_pct": 1.0205818614750757,
+  "avg_loss_pct": -0.9020726395205613,
+  "expectancy_pct": 0.08602230968369817,
+  "profit_factor": 1.1961841227706815,
+  "total_return_compounded_pct": 26383.79305338555,
+  "max_drawdown_pct": -95.96300514209845,
+  "sharpe_like": 6.05726372185541,
+  "net_pnl_rs": 304303.92050608253,
+  "capital_per_trade_rs": 50000.0,
+  "avg_hold_min": 224.38939929328623,
+  "median_hold_min": 255.0,
+  "max_win_streak": 80,
+  "max_loss_streak": 69
+}
