@@ -64,6 +64,10 @@ MAX_CAPITAL_RS: float = 10000000.0
 N_RECENT_SKIP = 500
 
 
+# --- Separate TP/SL analysis globals ---
+target_bew: float = 6.0       # take-profit %
+stoploss_new: float = -4.0    # stop-loss % (negative for long)
+
 # ----------------------- STRATEGY SELECTION -----------------------
 DEFAULT_STRATEGY_KEYS: list[str] = [
     "custom10", "custom09", "custom08", "custom07", "custom06",
@@ -870,26 +874,266 @@ def evaluate_signal_on_hourly_long_only(row: pd.Series, df_h: pd.DataFrame) -> d
             "max_adverse_pct": float(max_adv) if np.isfinite(max_adv) else np.nan,
         }
     else:
-        last_row = future.iloc[-1]
-        exit_time = last_row["date"]
-        exit_price = float(pd.to_numeric(last_row["close"], errors="coerce"))
-
-        pnl_pct = (exit_price - entry_price) / entry_price * 100.0
-        pnl_rs  = invested_amount * (pnl_pct / 100.0)
-
         return {
             HIT_COL: False,
+            "status": "OPEN",
             TIME_TD_COL: np.nan,
             TIME_CAL_COL: np.nan,
-            "exit_time": exit_time,
-            "exit_price": exit_price,
-            "pnl_pct": float(pnl_pct),
-            "pnl_rs": float(pnl_rs),
+            "exit_time": pd.NaT,
+            "exit_price": np.nan,
+            "pnl_pct": np.nan,
+            "pnl_rs": 0.0,  # keep 0 for easy sums
             "qty": int(qty),
             "invested_amount": float(invested_amount),
             "max_favorable_pct": float(max_fav) if np.isfinite(max_fav) else np.nan,
             "max_adverse_pct": float(max_adv) if np.isfinite(max_adv) else np.nan,
         }
+
+
+def evaluate_signal_hourly_tp_sl(
+    row: pd.Series,
+    df_h: pd.DataFrame,
+    target_pct: float,
+    stoploss_pct: float,
+    tie_break: str = "SL",   # if TP and SL both happen in same hourly bar, choose "SL" (conservative) or "TP"
+) -> dict:
+    """
+    Separate evaluation:
+      - Exit at first occurrence of either:
+          TP: future high >= entry * (1 + target_pct/100)
+          SL: future low  <= entry * (1 + stoploss_pct/100)   (stoploss_pct negative)
+      - If neither occurs, trade remains OPEN (no pnl, no exit_time)
+      - Uses invested_amount (qty * entry_price) like your main eval.
+
+    NOTE: In the same-bar TP+SL case, we can't know intrabar order from OHLC.
+          tie_break="SL" is conservative for LONGs.
+    """
+    entry_time = pd.to_datetime(row["signal_time_ist"])
+    if entry_time.tzinfo is None:
+        entry_time = entry_time.tz_localize(IST)
+    else:
+        entry_time = entry_time.tz_convert(IST)
+
+    entry_price = float(row["entry_price"])
+    if (not np.isfinite(entry_price)) or entry_price <= 0 or df_h is None or df_h.empty:
+        return {
+            "tp_hit": False,
+            "sl_hit": False,
+            "status_tp_sl": "BAD_DATA",
+            "exit_time_tp_sl": pd.NaT,
+            "exit_price_tp_sl": np.nan,
+            "pnl_pct_tp_sl": np.nan,
+            "pnl_rs_tp_sl": 0.0,
+            "days_to_exit_tp_sl": np.nan,
+        }
+
+    # sizing (use same logic as your main)
+    try:
+        qty = int(row.get("qty", 0)) if row.get("qty", None) is not None else 0
+    except Exception:
+        qty = 0
+    if qty <= 0:
+        qty = int(max(1, np.floor(CAPITAL_PER_SIGNAL_RS / entry_price)))
+
+    invested_amount = row.get("invested_amount", None)
+    try:
+        invested_amount = float(invested_amount) if invested_amount is not None else float(qty * entry_price)
+    except Exception:
+        invested_amount = float(qty * entry_price)
+
+    dfx = df_h.copy()
+    dfx["date"] = pd.to_datetime(dfx["date"], utc=True, errors="coerce").dt.tz_convert(IST)
+    dfx = dfx.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    future = dfx[dfx["date"] > entry_time].copy()
+    if future.empty or (not {"high", "low", "close"}.issubset(future.columns)):
+        return {
+            "tp_hit": False,
+            "sl_hit": False,
+            "status_tp_sl": "OPEN",
+            "exit_time_tp_sl": pd.NaT,
+            "exit_price_tp_sl": np.nan,
+            "pnl_pct_tp_sl": np.nan,
+            "pnl_rs_tp_sl": 0.0,
+            "days_to_exit_tp_sl": np.nan,
+            "qty_tp_sl": int(qty),
+            "invested_amount_tp_sl": float(invested_amount),
+        }
+
+    tp_price = entry_price * (1.0 + target_pct / 100.0)
+    sl_price = entry_price * (1.0 + stoploss_pct / 100.0)
+
+    hi = pd.to_numeric(future["high"], errors="coerce")
+    lo = pd.to_numeric(future["low"], errors="coerce")
+
+    tp_mask = (hi >= tp_price).fillna(False)
+    sl_mask = (lo <= sl_price).fillna(False)
+
+    if not (tp_mask.any() or sl_mask.any()):
+        return {
+            "tp_hit": False,
+            "sl_hit": False,
+            "status_tp_sl": "OPEN",
+            "exit_time_tp_sl": pd.NaT,
+            "exit_price_tp_sl": np.nan,
+            "pnl_pct_tp_sl": np.nan,
+            "pnl_rs_tp_sl": 0.0,
+            "days_to_exit_tp_sl": np.nan,
+            "qty_tp_sl": int(qty),
+            "invested_amount_tp_sl": float(invested_amount),
+        }
+
+    # first occurrence indexes (if exists)
+    tp_idx = int(np.argmax(tp_mask.values)) if tp_mask.any() else None
+    sl_idx = int(np.argmax(sl_mask.values)) if sl_mask.any() else None
+
+    # decide which happens first
+    exit_kind = None
+    if tp_idx is not None and sl_idx is not None:
+        if tp_idx < sl_idx:
+            exit_kind = "TP"
+        elif sl_idx < tp_idx:
+            exit_kind = "SL"
+        else:
+            # same bar: tie-break
+            exit_kind = "SL" if str(tie_break).upper() == "SL" else "TP"
+    elif tp_idx is not None:
+        exit_kind = "TP"
+    else:
+        exit_kind = "SL"
+
+    if exit_kind == "TP":
+        exit_row = future.iloc[tp_idx]
+        exit_time = exit_row["date"]
+        pnl_pct = float(target_pct)
+        pnl_rs = invested_amount * (pnl_pct / 100.0)
+        return {
+            "tp_hit": True,
+            "sl_hit": False,
+            "status_tp_sl": "TP",
+            "exit_time_tp_sl": exit_time,
+            "exit_price_tp_sl": float(tp_price),
+            "pnl_pct_tp_sl": pnl_pct,
+            "pnl_rs_tp_sl": float(pnl_rs),
+            "days_to_exit_tp_sl": float((exit_time - entry_time).total_seconds() / 86400.0),
+            "qty_tp_sl": int(qty),
+            "invested_amount_tp_sl": float(invested_amount),
+        }
+
+    # SL
+    exit_row = future.iloc[sl_idx]
+    exit_time = exit_row["date"]
+    pnl_pct = float(stoploss_pct)  # negative
+    pnl_rs = invested_amount * (pnl_pct / 100.0)
+    return {
+        "tp_hit": False,
+        "sl_hit": True,
+        "status_tp_sl": "SL",
+        "exit_time_tp_sl": exit_time,
+        "exit_price_tp_sl": float(sl_price),
+        "pnl_pct_tp_sl": pnl_pct,
+        "pnl_rs_tp_sl": float(pnl_rs),
+        "days_to_exit_tp_sl": float((exit_time - entry_time).total_seconds() / 86400.0),
+        "qty_tp_sl": int(qty),
+        "invested_amount_tp_sl": float(invested_amount),
+    }
+
+
+def run_tp_sl_profit_loss_analysis(
+    sig_df: pd.DataFrame,
+    data_cache: Dict[str, pd.DataFrame],
+    strategy_label: str,
+    ts: str,
+) -> pd.DataFrame:
+    """
+    Separate analysis printout:
+      - TP = target_bew%
+      - SL = stoploss_new%
+      - Only CLOSED trades (TP or SL) are used for capital P&L.
+      - OPEN trades (neither TP nor SL hit) are ignored (no exit, no pnl).
+    """
+    print("\n" + "=" * 72)
+    print(f"--- TP/SL PROFIT-LOSS ANALYSIS (TP={target_bew:.2f}%, SL={stoploss_new:.2f}%) ---")
+    print("=" * 72)
+
+    if sig_df is None or sig_df.empty:
+        print("No signals available.")
+        return pd.DataFrame()
+
+    # Ensure sizing exists
+    if ("qty" not in sig_df.columns) or ("invested_amount" not in sig_df.columns):
+        sig_df = attach_position_sizing(sig_df)
+
+    rows = []
+    for _, row in sig_df.iterrows():
+        tkr = row["ticker"]
+        df_h = data_cache.get(tkr, pd.DataFrame())
+        info = evaluate_signal_hourly_tp_sl(
+            row=row,
+            df_h=df_h,
+            target_pct=target_bew,
+            stoploss_pct=stoploss_new,
+            tie_break="SL",
+        )
+        rr = row.to_dict()
+        rr.update(info)
+        rows.append(rr)
+
+    out_tp_sl = pd.DataFrame(rows).sort_values(["signal_time_ist", "ticker"]).reset_index(drop=True)
+
+    total = len(out_tp_sl)
+    tp_cnt = int((out_tp_sl["status_tp_sl"] == "TP").sum())
+    sl_cnt = int((out_tp_sl["status_tp_sl"] == "SL").sum())
+    open_cnt = int((out_tp_sl["status_tp_sl"] == "OPEN").sum())
+    closed_cnt = tp_cnt + sl_cnt
+    win_rate = (tp_cnt / closed_cnt * 100.0) if closed_cnt else 0.0
+
+    print(f"Signals (total)        : {total}")
+    print(f"Closed (TP or SL)      : {closed_cnt}")
+    print(f"  TP hits              : {tp_cnt}")
+    print(f"  SL hits              : {sl_cnt}")
+    print(f"Open (ignored in P&L)  : {open_cnt}")
+    print(f"Win rate (TP/(TP+SL))  : {win_rate:.1f}%")
+
+    # time stats
+    if closed_cnt:
+        days = pd.to_numeric(out_tp_sl.loc[out_tp_sl["status_tp_sl"].isin(["TP","SL"]), "days_to_exit_tp_sl"], errors="coerce").dropna()
+        if not days.empty:
+            print(f"Avg days to exit (closed): {days.mean():.2f}")
+            print(f"Median days to exit      : {days.median():.2f}")
+
+    # Save full TP/SL result separately
+    tag = f"tp{_pct_tag(target_bew)}_sl{_pct_tag(abs(stoploss_new))}"
+    tp_sl_path = os.path.join(OUT_DIR, f"tp_sl_analysis_1h_{strategy_label}_{tag}_{ts}_IST.csv")
+    out_tp_sl.to_csv(tp_sl_path, index=False)
+    print(f"Saved TP/SL analysis CSV: {tp_sl_path}")
+
+    # Capital simulation ONLY on closed trades
+    closed = out_tp_sl[out_tp_sl["status_tp_sl"].isin(["TP", "SL"])].copy()
+    if closed.empty:
+        print("\nNo closed trades to compute realized P&L under TP/SL.")
+        return out_tp_sl
+
+    # Map into apply_capital_constraint expected columns
+    closed["exit_time"] = closed["exit_time_tp_sl"]
+    closed["pnl_rs"] = pd.to_numeric(closed["pnl_rs_tp_sl"], errors="coerce").fillna(0.0)
+    closed["pnl_pct"] = pd.to_numeric(closed["pnl_pct_tp_sl"], errors="coerce").fillna(0.0)
+
+    # IMPORTANT: Keep your existing invested_amount/qty as-is (per-signal investment rule)
+    # Then run capital constraint
+    closed_constrained, cap = apply_capital_constraint(closed)
+
+    print("\n--- TP/SL CAPITAL-CONSTRAINED (CLOSED TRADES ONLY) ---")
+    print(f"Signals closed     : {cap['total_signals']}")
+    print(f"Signals taken      : {cap['signals_taken']}")
+    print(f"Final value        : ₹{cap['final_portfolio_value']:,.2f}")
+    print(f"Net P&L            : ₹{cap['net_pnl_rs']:,.2f} ({cap['net_pnl_pct']:.2f}%)")
+
+    # Extra: realized P&L breakdown
+    realized_pnl = float(closed_constrained.loc[closed_constrained["taken"] == True, "pnl_rs"].sum()) if "taken" in closed_constrained.columns else float(closed_constrained["pnl_rs"].sum())
+    print(f"Realized P&L (taken): ₹{realized_pnl:,.2f}")
+
+    return out_tp_sl
 
 
 # ----------------------- PRINTS -----------------------
@@ -1305,6 +1549,10 @@ def main():
     )
     daily_summary.to_csv(daily_summary_path, index=False)
     print(f"\nSaved daily summary: {daily_summary_path}")
+
+    # --- Separate TP/SL analysis printout (TP=6%, SL=-4%) ---
+    run_tp_sl_profit_loss_analysis(sig_df=sig_df, data_cache=data_cache, strategy_label=strategy_label, ts=ts)
+
 
 
 if __name__ == "__main__":
