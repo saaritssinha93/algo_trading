@@ -1,0 +1,11 @@
+[
+  {
+    "name": "trend_pullback_tp2.0_sl2.0",
+    "family": "trend_pullback",
+    "params": {
+      "daily_adx_min": 10.80217937596726,
+      "rsi_min": 50.01352696597437,
+      "adx_min": 10.59785257324915
+    }
+  }
+]
