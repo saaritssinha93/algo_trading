@@ -124,16 +124,16 @@ import pandas as pd
 import pytz
 
 # ----------------------- CONFIG -----------------------
-DIR_etf_1h  = "main_indicators_etf_1h"
-DIR_D   = "main_indicators_etf_daily"
-DIR_W   = "main_indicators_etf_weekly"
+DIR_etf_1h  = "etf_indicators_1h"
+DIR_D   = "etf_indicators_daily"
+DIR_W   = "etf_indicators_weekly"
 OUT_DIR = "signals"
 
 IST = pytz.timezone("Asia/Kolkata")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ---- Target configuration (single source of truth) ----
-TARGET_PCT: float = 13.5  # <-- change this once (e.g. 4.0, 5.0, 7.0, 10.0)
+TARGET_PCT: float = 8  # <-- change this once (e.g. 4.0, 5.0, 7.0, 10.0)
 TARGET_MULT: float = 1.0 + TARGET_PCT / 100.0
 TARGET_INT: int = int(TARGET_PCT)  # used in names, assume integer percent
 TARGET_LABEL: str = f"{TARGET_INT}%"  # for printing
@@ -188,8 +188,8 @@ def _list_tickers_from_dir(directory: str, ending: str) -> set[str]:
     """
     List tickers in a directory by stripping a known suffix from filenames.
     Example:
-        directory = main_indicators_etf_1h
-        ending    = "_main_indicators_etf_1h.csv"
+        directory = etf_indicators_1h
+        ending    = "_etf_indicators_1h.csv"
     """
     pattern = os.path.join(directory, f"*{ending}")
     files = glob.glob(pattern)
@@ -210,9 +210,9 @@ def build_signals_for_ticker(ticker: str) -> list[dict]:
     Only minimal relaxations added to increase signal count
     while keeping overall P&L quality stable.
     """
-    path_etf_1h = os.path.join(DIR_etf_1h, f"{ticker}_main_indicators_etf_1h.csv")
-    path_d      = os.path.join(DIR_D,      f"{ticker}_main_indicators_etf_daily.csv")
-    path_w      = os.path.join(DIR_W,      f"{ticker}_main_indicators_etf_weekly.csv")
+    path_etf_1h = os.path.join(DIR_etf_1h, f"{ticker}_etf_indicators_1h.csv")
+    path_d      = os.path.join(DIR_D,      f"{ticker}_etf_indicators_daily.csv")
+    path_w      = os.path.join(DIR_W,      f"{ticker}_etf_indicators_weekly.csv")
 
     df_h = _safe_read_tf(path_etf_1h)
     df_d = _safe_read_tf(path_d)
@@ -546,9 +546,9 @@ def apply_capital_constraint(out_df: pd.DataFrame) -> dict:
 # ----------------------- MAIN -----------------------
 def main():
     # --------- PART 1: GENERATE LONG SIGNALS ---------
-    tickers_etf_1h = _list_tickers_from_dir(DIR_etf_1h, "_main_indicators_etf_1h.csv")
-    tickers_d  = _list_tickers_from_dir(DIR_D,  "_main_indicators_etf_daily.csv")
-    tickers_w  = _list_tickers_from_dir(DIR_W,  "_main_indicators_etf_weekly.csv")
+    tickers_etf_1h = _list_tickers_from_dir(DIR_etf_1h, "_etf_indicators_1h.csv")
+    tickers_d  = _list_tickers_from_dir(DIR_D,  "_etf_indicators_daily.csv")
+    tickers_w  = _list_tickers_from_dir(DIR_W,  "_etf_indicators_weekly.csv")
 
     tickers = tickers_etf_1h & tickers_d & tickers_w
     if not tickers:
@@ -624,7 +624,7 @@ def main():
     results = []
 
     for t in tickers_in_signals:
-        path_etf_1h = os.path.join(DIR_etf_1h, f"{t}_main_indicators_etf_1h.csv")
+        path_etf_1h = os.path.join(DIR_etf_1h, f"{t}_etf_indicators_1h.csv")
         df_etf_1h = _safe_read_etf_1h(path_etf_1h)
         if df_etf_1h.empty:
             print(f"- No 1H data for {t}, skipping its signals in evaluation.")
