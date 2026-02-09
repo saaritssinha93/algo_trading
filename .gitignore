@@ -218,3 +218,7 @@ request_token.txt
 *.html
 data_cache
 __pycache__
+
+# Include reports directory and its contents
+!reports/
+!reports/**
