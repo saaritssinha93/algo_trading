@@ -41,6 +41,7 @@ from avwap_v11_refactored.avwap_common import (
     compute_pnl_pct,
     trades_to_df,
     apply_topn_per_day,
+    volume_filter_pass,
 )
 
 
@@ -149,7 +150,11 @@ def avwap_distance_pass(
 def simulate_exit_short(
     df_day: pd.DataFrame, entry_idx: int, entry_price: float, cfg: StrategyConfig
 ) -> tuple:
-    """Walk forward within day until TARGET / SL / BE / EOD. Conservative: SL wins ties."""
+    """Walk forward within day until TARGET / SL / BE / TRAIL / EOD.
+
+    Exit priority: SL wins ties over TARGET (conservative).
+    Trailing stop: after BE trigger, trail from best (lowest) price seen.
+    """
     sl0 = entry_price * (1.0 + cfg.stop_pct)
     tgt = entry_price * (1.0 - cfg.target_pct)
 
@@ -157,25 +162,37 @@ def simulate_exit_short(
     be_armed = False
     be_trigger = entry_price * (1.0 - cfg.be_trigger_pct)
     be_sl = entry_price * (1.0 + cfg.be_pad_pct)
+    best_price = entry_price  # best (lowest) price seen for short
 
     for k in range(entry_idx + 1, len(df_day)):
         hi = float(df_day.at[k, "high"])
         lo = float(df_day.at[k, "low"])
         ts = df_day.at[k, "date"]
 
+        # Track best favorable price (lowest for SHORT)
+        if np.isfinite(lo) and lo < best_price:
+            best_price = lo
+
         if cfg.enable_breakeven and (not be_armed) and np.isfinite(lo) and lo <= be_trigger:
             be_armed = True
             sl = min(sl, be_sl)
+
+        # Trailing stop: after BE armed, trail from best price
+        if be_armed and cfg.enable_trailing_stop:
+            trail_sl = best_price * (1.0 + cfg.trail_pct)
+            sl = min(sl, trail_sl)  # trailing stop can only move down (tighter)
 
         hit_sl = np.isfinite(hi) and (hi >= sl)
         hit_tg = np.isfinite(lo) and (lo <= tgt)
 
         if hit_sl and hit_tg:
-            outcome = "BE" if (be_armed and abs(sl - be_sl) <= 1e-9) else "SL"
-            return k, ts, float(sl), outcome
+            if be_armed:
+                return k, ts, float(sl), "BE"
+            return k, ts, float(sl), "SL"
         if hit_sl:
-            outcome = "BE" if (be_armed and abs(sl - be_sl) <= 1e-9) else "SL"
-            return k, ts, float(sl), outcome
+            if be_armed:
+                return k, ts, float(sl), "BE"
+            return k, ts, float(sl), "SL"
         if hit_tg:
             return k, ts, float(tgt), "TARGET"
 
@@ -263,6 +280,11 @@ def scan_one_day(
             continue
 
         if cfg.use_atr_pct_filter and (atr1 / close1) < cfg.atr_pct_min:
+            i += 1
+            continue
+
+        # Volume confirmation: impulse bar should have above-average volume
+        if not volume_filter_pass(c1, cfg):
             i += 1
             continue
 

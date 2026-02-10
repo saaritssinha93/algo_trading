@@ -41,6 +41,7 @@ from avwap_v11_refactored.avwap_common import (
     compute_pnl_pct,
     trades_to_df,
     apply_topn_per_day,
+    volume_filter_pass,
 )
 
 
@@ -162,18 +163,27 @@ def _count_max_consec_above(close_s: pd.Series, avwap_s: pd.Series) -> int:
 def simulate_exit_long(
     df_day: pd.DataFrame, entry_idx: int, entry_price: float, cfg: StrategyConfig
 ) -> tuple:
-    """Walk forward within day until TARGET / SL / BE / EOD. Conservative: SL wins ties."""
+    """Walk forward within day until TARGET / SL / BE / TRAIL / EOD.
+
+    Exit priority: SL wins ties over TARGET (conservative).
+    Trailing stop: after BE trigger, trail from best (highest) price seen.
+    """
     sl = entry_price * (1.0 - cfg.stop_pct)
     tgt = entry_price * (1.0 + cfg.target_pct)
 
     sl_curr = float(sl)
     be_armed = False
     be_level = entry_price * (1.0 + cfg.be_pad_pct)
+    best_price = entry_price  # best (highest) price seen for long
 
     for k in range(entry_idx + 1, len(df_day)):
         hi = float(df_day.at[k, "high"])
         lo = float(df_day.at[k, "low"])
         ts = df_day.at[k, "date"]
+
+        # Track best favorable price (highest for LONG)
+        if np.isfinite(hi) and hi > best_price:
+            best_price = hi
 
         if (
             cfg.enable_breakeven
@@ -184,15 +194,20 @@ def simulate_exit_long(
             be_armed = True
             sl_curr = max(sl_curr, be_level)
 
+        # Trailing stop: after BE armed, trail from best price
+        if be_armed and cfg.enable_trailing_stop:
+            trail_sl = best_price * (1.0 - cfg.trail_pct)
+            sl_curr = max(sl_curr, trail_sl)  # trailing stop can only move up (tighter)
+
         hit_sl = np.isfinite(lo) and lo <= sl_curr
         hit_tg = np.isfinite(hi) and hi >= tgt
 
         if hit_sl and hit_tg:
-            if be_armed and sl_curr >= entry_price:
+            if be_armed:
                 return k, ts, float(sl_curr), "BE"
             return k, ts, float(sl_curr), "SL"
         if hit_sl:
-            if be_armed and sl_curr >= entry_price:
+            if be_armed:
                 return k, ts, float(sl_curr), "BE"
             return k, ts, float(sl_curr), "SL"
         if hit_tg:
@@ -284,6 +299,11 @@ def scan_one_day(
             continue
 
         if cfg.use_atr_pct_filter and (atr1 / close1) < cfg.atr_pct_min:
+            i += 1
+            continue
+
+        # Volume confirmation: impulse bar should have above-average volume
+        if not volume_filter_pass(c1, cfg):
             i += 1
             continue
 

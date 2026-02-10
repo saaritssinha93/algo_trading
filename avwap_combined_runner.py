@@ -51,6 +51,7 @@ from avwap_v11_refactored.avwap_common import (
     print_metrics,
     read_15m_parquet,
     list_tickers_15m,
+    generate_backtest_charts,
 )
 from avwap_v11_refactored.avwap_short_strategy import (
     scan_all_days_for_ticker as scan_short,
@@ -355,8 +356,21 @@ def main() -> None:
     print("AVWAP v11 COMBINED runner — LONG + SHORT (refactored)")
     print("=" * 70)
 
-    short_cfg = default_short_config(reports_dir=REPORTS_DIR)
-    long_cfg = default_long_config(reports_dir=REPORTS_DIR)
+    # Reports dir: always under the algo_trading project root, regardless of
+    # whether this script is run from avwap_v11_refactored/ or the project root.
+    _script_dir = Path(__file__).resolve().parent
+    if _script_dir.name == "avwap_v11_refactored":
+        _project_root = _script_dir.parent
+    else:
+        _project_root = _script_dir
+    _reports_dir = _project_root / "reports"
+
+    short_cfg = default_short_config(
+        reports_dir=_reports_dir,
+    )
+    long_cfg = default_long_config(
+        reports_dir=_reports_dir,
+    )
 
     print(f"[INFO] SHORT config: SL={short_cfg.stop_pct*100:.1f}%, TGT={short_cfg.target_pct*100:.1f}%, "
           f"slippage={short_cfg.slippage_pct*10000:.0f}bps, comm={short_cfg.commission_pct*10000:.0f}bps")
@@ -401,6 +415,19 @@ def main() -> None:
     ts = now_ist().strftime("%Y%m%d_%H%M%S")
     out_csv = reports_dir / f"avwap_longshort_trades_ALL_DAYS_{ts}.csv"
     combined.to_csv(out_csv, index=False)
+
+    # --- Generate Charts ---
+    print("\n[INFO] Generating backtest charts...")
+    chart_dir = reports_dir / "charts"
+    chart_files = generate_backtest_charts(
+        combined, short_df, long_df, save_dir=chart_dir, ts_label=ts,
+    )
+    if chart_files:
+        print(f"[INFO] {len(chart_files)} charts saved to {chart_dir}/")
+        for cf in chart_files:
+            print(f"  -> {cf}")
+    else:
+        print("[WARN] No charts generated (matplotlib may not be installed).")
 
     # --- Sample output ---
     cols = [

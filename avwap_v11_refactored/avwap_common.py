@@ -61,7 +61,7 @@ class StrategyConfig:
     stop_pct: float = 0.0100
     target_pct: float = 0.0100
 
-    # --- Slippage & commission (NEW) ---
+    # --- Slippage & commission ---
     slippage_pct: float = 0.0005   # 5 bps one-way
     commission_pct: float = 0.0003  # 3 bps round-trip (STT + brokerage approx)
 
@@ -105,6 +105,11 @@ class StrategyConfig:
     use_atr_pct_filter: bool = True
     atr_pct_min: float = 0.0020
 
+    # --- Volume filter ---
+    use_volume_filter: bool = True
+    volume_sma_period: int = 20
+    volume_min_ratio: float = 1.2   # impulse bar vol >= 1.2x avg volume
+
     # --- AVWAP rules (Option B) ---
     require_avwap_rule: bool = True
     avwap_touch: bool = True
@@ -122,10 +127,13 @@ class StrategyConfig:
     be_trigger_pct: float = 0.0040
     be_pad_pct: float = 0.0001
 
+    # Trailing stop (activates after BE trigger, trails by trail_pct from best price)
+    enable_trailing_stop: bool = True
+    trail_pct: float = 0.0030  # trail 0.30% from best favorable price after BE trigger
+
     # Top-N per day
     enable_topn_per_day: bool = True
     topn_per_day: int = 30
-
 
     # Long setup toggles
     # Disable the moderate pullback-break setup by default (was a net drag in research)
@@ -135,32 +143,57 @@ class StrategyConfig:
 
 
 def default_short_config(**overrides) -> StrategyConfig:
-    """Factory for the SHORT side with typical v11 defaults."""
+    """Factory for the SHORT side with optimized v11 defaults.
+
+    Rationale:
+    - SL=0.75%: tighter SL cuts losers faster (was 1.0%, most losses happen quickly)
+    - TGT=1.2%: better R:R (1.6:1) captures more from momentum moves
+    - BE trigger 0.50%: gives trades more room to develop, reduces excessive BE exits
+    - Trail 0.30%: locks in partial gains instead of giving back to flat BE
+    - Afternoon window added: captures late-day momentum setups (13:00-14:30)
+    - topn_per_day=10: allows more quality trades per day
+    """
     base = dict(
         side="SHORT",
-        stop_pct=0.0100,
-        target_pct=0.0100,
+        stop_pct=0.0075,
+        target_pct=0.0120,
+        be_trigger_pct=0.0050,
+        trail_pct=0.0030,
         mod_impulse_min_atr=0.45,
         rsi_max_short=55.0,
         stochk_max=75.0,
-        topn_per_day=8,
-        signal_windows=[(dtime(9, 15, 0), dtime(11, 30, 0))],
+        topn_per_day=10,
+        signal_windows=[
+            (dtime(9, 15, 0), dtime(11, 30, 0)),
+            (dtime(13, 0, 0), dtime(14, 30, 0)),
+        ],
     )
     base.update(overrides)
     return StrategyConfig(**base)
 
 
 def default_long_config(**overrides) -> StrategyConfig:
-    """Factory for the LONG side with typical v11 defaults."""
+    """Factory for the LONG side with optimized v11 defaults.
+
+    Rationale:
+    - SL=0.75%: tighter SL consistent with SHORT side
+    - TGT=1.5%: slightly reduced from 2.0% to increase hit-rate and trade count
+    - BE trigger 0.60%: wider trigger so fewer trades exit at flat BE
+    - ADX slope relaxed to 0.80: allows trending stocks that are steady (not just surging)
+    - topn_per_day=10: allows more quality trades per day
+    """
     base = dict(
         side="LONG",
-        stop_pct=0.0100,
-        target_pct=0.0200,
+        stop_pct=0.0075,
+        target_pct=0.0150,
+        be_trigger_pct=0.0060,
+        trail_pct=0.0030,
+        adx_slope_min=0.80,
         mod_impulse_min_atr=0.30,
         rsi_min_long=45.0,
         stochk_min=25.0,
         stochk_max=95.0,
-        topn_per_day=8,
+        topn_per_day=10,
     )
     base.update(overrides)
     return StrategyConfig(**base)
@@ -418,6 +451,13 @@ def prepare_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
         out["ADX15"] = pd.to_numeric(out["ADX"], errors="coerce")
     else:
         out["ADX15"] = compute_adx14(out)
+
+    # Volume SMA (for volume filter)
+    if "volume" in out.columns:
+        vol = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+        out["VOL_SMA20"] = vol.rolling(20, min_periods=1).mean()
+    else:
+        out["VOL_SMA20"] = np.nan
 
     out["day"] = out["date"].dt.tz_convert(IST).dt.date
     return out
@@ -733,3 +773,219 @@ def apply_topn_per_day(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return d
+
+
+# ===========================================================================
+# VOLUME FILTER HELPER
+# ===========================================================================
+def volume_filter_pass(row: pd.Series, cfg: StrategyConfig) -> bool:
+    """Check that the impulse bar has above-average volume (confirms institutional participation)."""
+    if not cfg.use_volume_filter:
+        return True
+    vol = float(row.get("volume", 0.0)) if np.isfinite(row.get("volume", np.nan)) else 0.0
+    vol_sma = float(row.get("VOL_SMA20", 0.0)) if np.isfinite(row.get("VOL_SMA20", np.nan)) else 0.0
+    if vol_sma <= 0:
+        return True  # no volume data available — pass through
+    return vol >= (cfg.volume_min_ratio * vol_sma)
+
+
+# ===========================================================================
+# GRAPHICAL OUTPUT — Charts for backtest analysis
+# ===========================================================================
+def generate_backtest_charts(
+    df: pd.DataFrame,
+    short_df: pd.DataFrame,
+    long_df: pd.DataFrame,
+    save_dir: Path,
+    ts_label: str = "",
+) -> List[str]:
+    """Generate and save backtest analysis charts. Returns list of saved file paths."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        print("[WARN] matplotlib not installed — skipping chart generation.")
+        return []
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[str] = []
+
+    if df.empty:
+        return saved
+
+    d = df.copy()
+    d["pnl_pct"] = pd.to_numeric(d["pnl_pct"], errors="coerce").fillna(0.0)
+    d["trade_date"] = pd.to_datetime(d["trade_date"], errors="coerce")
+    d = d.sort_values("trade_date").reset_index(drop=True)
+
+    # --- 1. Cumulative Equity Curve (by side + combined) ---
+    fig, ax = plt.subplots(figsize=(14, 6))
+    # Combined
+    cum_all = d["pnl_pct"].cumsum()
+    ax.plot(range(len(cum_all)), cum_all.values, label="Combined", color="black", linewidth=2)
+    # SHORT
+    if not short_df.empty:
+        s = short_df.copy()
+        s["pnl_pct"] = pd.to_numeric(s["pnl_pct"], errors="coerce").fillna(0.0)
+        cum_s = s["pnl_pct"].cumsum()
+        ax.plot(range(len(cum_s)), cum_s.values, label="SHORT", color="red", alpha=0.7)
+    # LONG
+    if not long_df.empty:
+        l = long_df.copy()
+        l["pnl_pct"] = pd.to_numeric(l["pnl_pct"], errors="coerce").fillna(0.0)
+        cum_l = l["pnl_pct"].cumsum()
+        ax.plot(range(len(cum_l)), cum_l.values, label="LONG", color="green", alpha=0.7)
+    ax.set_xlabel("Trade #")
+    ax.set_ylabel("Cumulative PnL (%)")
+    ax.set_title("Equity Curve — Cumulative PnL % (net)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    p = save_dir / f"equity_curve_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # --- 2. Daily PnL by Date ---
+    fig, ax = plt.subplots(figsize=(14, 5))
+    daily_pnl = d.groupby("trade_date")["pnl_pct"].sum()
+    colors = ["green" if v >= 0 else "red" for v in daily_pnl.values]
+    ax.bar(range(len(daily_pnl)), daily_pnl.values, color=colors, alpha=0.7, width=0.8)
+    ax.set_xlabel("Trading Day (index)")
+    ax.set_ylabel("Daily Net PnL (%)")
+    ax.set_title("Daily PnL — Sum of All Trades per Day")
+    ax.axhline(y=0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3, axis="y")
+    p = save_dir / f"daily_pnl_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # --- 3. Outcome Distribution (pie chart) ---
+    if "outcome" in d.columns:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        outcome_colors = {"TARGET": "#2ecc71", "SL": "#e74c3c", "BE": "#f39c12", "EOD": "#3498db"}
+
+        for ax, (title, sub) in zip(axes, [
+            ("Combined", d),
+            ("SHORT", d[d["side"] == "SHORT"]),
+            ("LONG", d[d["side"] == "LONG"]),
+        ]):
+            if sub.empty:
+                ax.set_title(f"{title} (no data)")
+                continue
+            counts = sub["outcome"].value_counts()
+            labels = [f"{k}\n({v}, {v/len(sub)*100:.1f}%)" for k, v in counts.items()]
+            cols = [outcome_colors.get(k, "gray") for k in counts.index]
+            ax.pie(counts.values, labels=labels, colors=cols, startangle=90)
+            ax.set_title(f"{title} Outcomes (n={len(sub)})")
+
+        fig.suptitle("Trade Outcome Distribution", fontsize=14, fontweight="bold")
+        fig.tight_layout()
+        p = save_dir / f"outcome_distribution_{ts_label}.png"
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(str(p))
+
+    # --- 4. PnL Distribution Histogram ---
+    fig, ax = plt.subplots(figsize=(12, 5))
+    pnl_vals = d["pnl_pct"].values
+    ax.hist(pnl_vals, bins=50, color="steelblue", edgecolor="white", alpha=0.8)
+    ax.axvline(x=0, color="red", linestyle="--", linewidth=1.5, label="Breakeven")
+    ax.axvline(x=np.mean(pnl_vals), color="green", linestyle="-", linewidth=1.5,
+               label=f"Mean={np.mean(pnl_vals):.3f}%")
+    ax.set_xlabel("PnL per Trade (%)")
+    ax.set_ylabel("Frequency")
+    ax.set_title("PnL Distribution — All Trades (net)")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    p = save_dir / f"pnl_distribution_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # --- 5. Trades per Day Histogram ---
+    fig, ax = plt.subplots(figsize=(10, 5))
+    trades_per_day = d.groupby("trade_date").size()
+    ax.hist(trades_per_day.values, bins=range(0, int(trades_per_day.max()) + 2),
+            color="teal", edgecolor="white", alpha=0.8, align="left")
+    ax.axvline(x=trades_per_day.mean(), color="red", linestyle="--",
+               label=f"Avg={trades_per_day.mean():.1f}/day")
+    ax.set_xlabel("Trades per Day")
+    ax.set_ylabel("Number of Days")
+    ax.set_title("Trade Frequency Distribution")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    p = save_dir / f"trades_per_day_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # --- 6. Drawdown Chart ---
+    fig, ax = plt.subplots(figsize=(14, 5))
+    cum = d["pnl_pct"].cumsum().values
+    running_max = np.maximum.accumulate(cum)
+    drawdown = running_max - cum
+    ax.fill_between(range(len(drawdown)), drawdown, color="red", alpha=0.3)
+    ax.plot(range(len(drawdown)), drawdown, color="red", linewidth=0.8)
+    ax.set_xlabel("Trade #")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_title("Drawdown from Peak — Cumulative PnL")
+    ax.grid(True, alpha=0.3)
+    ax.invert_yaxis()
+    p = save_dir / f"drawdown_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # --- 7. Win Rate by Hour of Day ---
+    if "entry_time_ist" in d.columns:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        d["entry_time_ist"] = pd.to_datetime(d["entry_time_ist"], errors="coerce")
+        d["entry_hour"] = d["entry_time_ist"].dt.hour
+        hourly = d.groupby("entry_hour").agg(
+            count=("pnl_pct", "size"),
+            wins=("pnl_pct", lambda x: (x > 0).sum()),
+            avg_pnl=("pnl_pct", "mean"),
+        )
+        hourly["win_rate"] = hourly["wins"] / hourly["count"] * 100
+
+        ax2 = ax.twinx()
+        bars = ax.bar(hourly.index, hourly["count"], color="steelblue", alpha=0.6, label="Trade Count")
+        line = ax2.plot(hourly.index, hourly["win_rate"], color="green", marker="o",
+                        linewidth=2, label="Win Rate %")
+        ax.set_xlabel("Hour of Day (IST)")
+        ax.set_ylabel("Number of Trades")
+        ax2.set_ylabel("Win Rate (%)")
+        ax.set_title("Trade Activity & Win Rate by Hour")
+        ax.set_xticks(hourly.index)
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+        ax.grid(True, alpha=0.3, axis="y")
+        p = save_dir / f"hourly_analysis_{ts_label}.png"
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(str(p))
+
+    # --- 8. Monthly Returns Heatmap ---
+    fig, ax = plt.subplots(figsize=(12, 4))
+    d["year_month"] = d["trade_date"].dt.to_period("M")
+    monthly_pnl = d.groupby("year_month")["pnl_pct"].sum()
+    colors_m = ["green" if v >= 0 else "red" for v in monthly_pnl.values]
+    x_labels = [str(p) for p in monthly_pnl.index]
+    ax.bar(range(len(monthly_pnl)), monthly_pnl.values, color=colors_m, alpha=0.7)
+    ax.set_xticks(range(len(x_labels)))
+    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Monthly Net PnL (%)")
+    ax.set_title("Monthly Return Summary")
+    ax.axhline(y=0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3, axis="y")
+    p = save_dir / f"monthly_returns_{ts_label}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    return saved
