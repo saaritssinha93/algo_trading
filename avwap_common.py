@@ -126,6 +126,10 @@ class StrategyConfig:
     enable_topn_per_day: bool = True
     topn_per_day: int = 30
 
+
+    # Long setup toggles
+    # Disable the moderate pullback-break setup by default (was a net drag in research)
+    enable_setup_a_pullback_c2_break: bool = False
     # --- Output ---
     reports_dir: Path = field(default_factory=lambda: Path(".") / "reports")
 
@@ -139,6 +143,8 @@ def default_short_config(**overrides) -> StrategyConfig:
         mod_impulse_min_atr=0.45,
         rsi_max_short=55.0,
         stochk_max=75.0,
+        topn_per_day=8,
+        signal_windows=[(dtime(9, 15, 0), dtime(11, 30, 0))],
     )
     base.update(overrides)
     return StrategyConfig(**base)
@@ -154,6 +160,7 @@ def default_long_config(**overrides) -> StrategyConfig:
         rsi_min_long=45.0,
         stochk_min=25.0,
         stochk_max=95.0,
+        topn_per_day=8,
     )
     base.update(overrides)
     return StrategyConfig(**base)

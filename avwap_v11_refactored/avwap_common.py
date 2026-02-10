@@ -131,6 +131,10 @@ class StrategyConfig:
     enable_topn_per_day: bool = True
     topn_per_day: int = 30
 
+
+    # Long setup toggles
+    # Disable the moderate pullback-break setup by default (was a net drag in research)
+    enable_setup_a_pullback_c2_break: bool = False
     # --- Output ---
     reports_dir: Path = field(default_factory=lambda: Path(".") / "reports")
 

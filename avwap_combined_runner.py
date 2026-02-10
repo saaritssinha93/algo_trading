@@ -174,6 +174,18 @@ def _add_notional_pnl(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     d = df.copy()
+    # Ensure we always carry gross P&L too (before slippage/commission).
+    # Older report files may not have this column.
+    if (
+        "pnl_pct_gross" not in d.columns
+        and {"entry_price", "exit_price", "side"}.issubset(d.columns)
+    ):
+        ep = pd.to_numeric(d["entry_price"], errors="coerce")
+        xp = pd.to_numeric(d["exit_price"], errors="coerce")
+        s = d["side"].astype(str).str.upper()
+        denom = ep.replace(0, np.nan)
+        gross = np.where(s.eq("SHORT"), (ep - xp) / denom * 100.0, (xp - ep) / denom * 100.0)
+        d["pnl_pct_gross"] = pd.to_numeric(gross, errors="coerce").fillna(0.0)
     d["pnl_pct"] = pd.to_numeric(d["pnl_pct"], errors="coerce").fillna(0.0)
     d["position_size_rs"] = d["side"].map(
         lambda x: POSITION_SIZE_RS_SHORT if str(x).upper() == "SHORT" else POSITION_SIZE_RS_LONG

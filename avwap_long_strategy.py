@@ -391,7 +391,8 @@ def scan_one_day(
                 i = exit_idx + 1
                 continue
 
-            # Option 2: small red pullback C2 (above AVWAP), then break C2 high on C3
+            # Option 2 (optional): small red pullback C2 (above AVWAP), then break C2 high on C3
+            # Controlled by cfg.enable_setup_a_pullback_c2_break (default False)
             c2o, c2c = float(c2["open"]), float(c2["close"])
             c2_body = abs(c2c - c2o)
             c2_atr = float(c2["ATR15"]) if np.isfinite(c2["ATR15"]) else atr1
@@ -404,7 +405,7 @@ def scan_one_day(
             )
             c2_above_avwap = np.isfinite(c2_avwap) and (c2c > c2_avwap)
 
-            if c2_small_red and c2_above_avwap and (i + 2 < len(df_day)):
+            if cfg.enable_setup_a_pullback_c2_break and c2_small_red and c2_above_avwap and (i + 2 < len(df_day)):
                 c3 = df_day.iloc[i + 2]
                 high2 = float(c2["high"])
                 buf2 = entry_buffer(high2, cfg)
