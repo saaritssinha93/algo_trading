@@ -42,7 +42,6 @@ from avwap_v11_refactored.avwap_common import (
     IST,
     StrategyConfig,
     Trade,
-    BacktestMetrics,
     default_short_config,
     default_long_config,
     now_ist,
@@ -73,6 +72,13 @@ DISALLOW_BOTH_SIDES_SAME_TICKER_DAY = False
 
 # Parallelism: set to 1 for serial, >1 for multi-process
 MAX_WORKERS = 4
+
+
+# ==========================================================================
+# OUTPUT PATHS
+# ==========================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+REPORTS_DIR = PROJECT_ROOT / "reports"
 
 
 # ===========================================================================
@@ -340,6 +346,7 @@ def _print_notional_pnl(combined: pd.DataFrame) -> None:
     print("=" * 61)
 
 
+
 # ===========================================================================
 # MAIN
 # ===========================================================================
@@ -348,12 +355,8 @@ def main() -> None:
     print("AVWAP v11 COMBINED runner — LONG + SHORT (refactored)")
     print("=" * 70)
 
-    short_cfg = default_short_config(
-        reports_dir=Path(__file__).resolve().parent.parent / "reports",
-    )
-    long_cfg = default_long_config(
-        reports_dir=Path(__file__).resolve().parent.parent / "reports",
-    )
+    short_cfg = default_short_config(reports_dir=REPORTS_DIR)
+    long_cfg = default_long_config(reports_dir=REPORTS_DIR)
 
     print(f"[INFO] SHORT config: SL={short_cfg.stop_pct*100:.1f}%, TGT={short_cfg.target_pct*100:.1f}%, "
           f"slippage={short_cfg.slippage_pct*10000:.0f}bps, comm={short_cfg.commission_pct*10000:.0f}bps")
@@ -375,9 +378,13 @@ def main() -> None:
     combined = _add_notional_pnl(combined)
 
     # --- Comprehensive metrics ---
-    print_metrics("SHORT (net of slippage+comm)", compute_backtest_metrics(short_df))
-    print_metrics("LONG (net of slippage+comm)", compute_backtest_metrics(long_df))
-    print_metrics("COMBINED (net of slippage+comm)", compute_backtest_metrics(combined))
+    short_metrics = compute_backtest_metrics(short_df)
+    long_metrics = compute_backtest_metrics(long_df)
+    combined_metrics = compute_backtest_metrics(combined)
+
+    print_metrics("SHORT (net of slippage+comm)", short_metrics)
+    print_metrics("LONG (net of slippage+comm)", long_metrics)
+    print_metrics("COMBINED (net of slippage+comm)", combined_metrics)
 
     _print_notional_pnl(combined)
 

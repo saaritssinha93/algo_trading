@@ -219,6 +219,8 @@ request_token.txt
 data_cache
 __pycache__
 
-# Include reports directory and its contents
+
+# Include reports directory but only CSV files inside it
 !reports/
-!reports/**
+reports/**
+!reports/**/*.csv
