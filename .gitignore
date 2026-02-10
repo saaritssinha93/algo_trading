@@ -228,5 +228,4 @@ outputs/**
 # Include backtesting directory but only CSV and py files inside it
 !backtesting/
 backtesting/**
-!backtesting/**/*.csv
-!backtesting/**/*.py
+!backtesting/eqidv1/**/*.py
