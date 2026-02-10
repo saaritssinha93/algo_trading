@@ -80,6 +80,8 @@ MAX_WORKERS = 4
 # ==========================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent
 REPORTS_DIR = PROJECT_ROOT / "outputs"
+DATA_DIR_5M = "stocks_indicators_5min_eq"
+DATA_SUFFIX_5M = "_stocks_indicators_5min.parquet"
 
 
 # ===========================================================================
@@ -347,6 +349,120 @@ def _print_notional_pnl(combined: pd.DataFrame) -> None:
     print("=" * 61)
 
 
+def _generate_detailed_analysis_charts(
+    combined: pd.DataFrame,
+    save_dir: Path,
+    ts_label: str,
+) -> List[str]:
+    """Generate additional detailed charts for deeper diagnostics."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not installed — skipping detailed chart generation.")
+        return []
+
+    if combined.empty:
+        return []
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[str] = []
+
+    d = combined.copy()
+    d["pnl_pct"] = pd.to_numeric(d["pnl_pct"], errors="coerce").fillna(0.0)
+    d["entry_time_ist"] = pd.to_datetime(d.get("entry_time_ist"), errors="coerce")
+    d["trade_date"] = pd.to_datetime(d.get("trade_date"), errors="coerce")
+    d = d.sort_values("entry_time_ist").reset_index(drop=True)
+
+    # 1) Rolling performance profile
+    fig, axes = plt.subplots(2, 1, figsize=(15, 9), sharex=True)
+    rolling_n = 50 if len(d) >= 50 else max(10, len(d) // 2)
+    d["win_flag"] = (d["pnl_pct"] > 0).astype(float)
+    d["roll_win_rate"] = d["win_flag"].rolling(rolling_n, min_periods=5).mean() * 100.0
+    d["roll_avg_pnl"] = d["pnl_pct"].rolling(rolling_n, min_periods=5).mean()
+
+    axes[0].plot(d.index, d["roll_win_rate"], color="darkgreen", linewidth=2)
+    axes[0].axhline(50, linestyle="--", color="gray", alpha=0.6)
+    axes[0].set_ylabel("Win Rate (%)")
+    axes[0].set_title(f"Rolling Win Rate ({rolling_n}-trade window)")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(d.index, d["roll_avg_pnl"], color="navy", linewidth=2)
+    axes[1].axhline(0, linestyle="--", color="gray", alpha=0.6)
+    axes[1].set_xlabel("Trade #")
+    axes[1].set_ylabel("Avg PnL (%)")
+    axes[1].set_title(f"Rolling Average PnL ({rolling_n}-trade window)")
+    axes[1].grid(True, alpha=0.3)
+
+    p = save_dir / f"rolling_performance_{ts_label}.png"
+    fig.tight_layout()
+    fig.savefig(p, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+    saved.append(str(p))
+
+    # 2) Day-of-week and hour performance heatmap
+    if d["entry_time_ist"].notna().any():
+        h = d[d["entry_time_ist"].notna()].copy()
+        h["weekday"] = h["entry_time_ist"].dt.day_name().str[:3]
+        h["hour"] = h["entry_time_ist"].dt.hour
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        heat = h.pivot_table(
+            index="weekday",
+            columns="hour",
+            values="pnl_pct",
+            aggfunc="mean",
+        ).reindex(weekdays)
+
+        fig, ax = plt.subplots(figsize=(13, 6))
+        im = ax.imshow(heat.values, aspect="auto", cmap="RdYlGn", vmin=-0.3, vmax=0.3)
+        ax.set_xticks(range(len(heat.columns)))
+        ax.set_xticklabels(heat.columns, rotation=45)
+        ax.set_yticks(range(len(heat.index)))
+        ax.set_yticklabels(heat.index)
+        ax.set_title("Average PnL (%) Heatmap by Weekday x Entry Hour")
+        ax.set_xlabel("Entry Hour (IST)")
+        ax.set_ylabel("Weekday")
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Mean PnL (%)")
+
+        p = save_dir / f"weekday_hour_heatmap_{ts_label}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=170, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(str(p))
+
+    # 3) Side-wise cumulative equity on same time axis
+    if "side" in d.columns and d["entry_time_ist"].notna().any():
+        fig, ax = plt.subplots(figsize=(15, 6))
+        for side, color in [("SHORT", "#d62728"), ("LONG", "#2ca02c")]:
+            sub = d[d["side"].astype(str).str.upper() == side].copy()
+            if sub.empty:
+                continue
+            sub = sub.sort_values("entry_time_ist")
+            sub["cum"] = sub["pnl_pct"].cumsum()
+            ax.plot(sub["entry_time_ist"], sub["cum"], label=f"{side} Cumulative", color=color, linewidth=2)
+
+        d2 = d.sort_values("entry_time_ist").copy()
+        d2["cum"] = d2["pnl_pct"].cumsum()
+        ax.plot(d2["entry_time_ist"], d2["cum"], label="COMBINED", color="black", linewidth=2.3)
+        ax.axhline(0, color="gray", linestyle="--", alpha=0.6)
+        ax.set_title("Cumulative Equity by Side (Time-Synced)")
+        ax.set_xlabel("Entry Time")
+        ax.set_ylabel("Cumulative PnL (%)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        p = save_dir / f"equity_by_side_time_{ts_label}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=170, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(str(p))
+
+    return saved
+
+
 
 # ===========================================================================
 # MAIN
@@ -356,20 +472,24 @@ def main() -> None:
     print("AVWAP v11 COMBINED runner — LONG + SHORT (refactored)")
     print("=" * 70)
 
-    # Reports dir: always under the algo_trading project root, regardless of
+    # Outputs dir: always under the algo_trading project root, regardless of
     # whether this script is run from avwap_v11_refactored/ or the project root.
     _script_dir = Path(__file__).resolve().parent
     if _script_dir.name == "avwap_v11_refactored":
         _project_root = _script_dir.parent
     else:
         _project_root = _script_dir
-    _reports_dir = _project_root / "reports"
+    _reports_dir = _project_root / "outputs"
 
     short_cfg = default_short_config(
         reports_dir=_reports_dir,
+        dir_15m=DATA_DIR_5M,
+        end_15m=DATA_SUFFIX_5M,
     )
     long_cfg = default_long_config(
         reports_dir=_reports_dir,
+        dir_15m=DATA_DIR_5M,
+        end_15m=DATA_SUFFIX_5M,
     )
 
     print(f"[INFO] SHORT config: SL={short_cfg.stop_pct*100:.1f}%, TGT={short_cfg.target_pct*100:.1f}%, "
@@ -428,6 +548,16 @@ def main() -> None:
             print(f"  -> {cf}")
     else:
         print("[WARN] No charts generated (matplotlib may not be installed).")
+
+    detailed_chart_files = _generate_detailed_analysis_charts(
+        combined=combined,
+        save_dir=chart_dir,
+        ts_label=ts,
+    )
+    if detailed_chart_files:
+        print(f"[INFO] {len(detailed_chart_files)} detailed charts saved to {chart_dir}/")
+        for cf in detailed_chart_files:
+            print(f"  -> {cf}")
 
     # --- Sample output ---
     cols = [
