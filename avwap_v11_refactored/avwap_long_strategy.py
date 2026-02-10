@@ -298,29 +298,6 @@ def scan_one_day(
         ema20 = float(c1["EMA20"]) if np.isfinite(c1.get("EMA20", np.nan)) else 0.0
         atr_pct = atr1 / close1
 
-        # --- NEW: Volume gate (signal bar vs rolling average) ---
-        if cfg.min_signal_volume_factor > 0 and "VOL_AVG20" in df_day.columns:
-            sig_vol = float(c1.get("volume", 0.0)) if np.isfinite(c1.get("volume", 0.0)) else 0.0
-            avg_vol = float(c1.get("VOL_AVG20", 0.0)) if np.isfinite(c1.get("VOL_AVG20", 0.0)) else 0.0
-            if avg_vol > 0 and sig_vol < cfg.min_signal_volume_factor * avg_vol:
-                i += 1
-                continue
-
-        # --- NEW: Pre-compute quality score components for early filtering ---
-        adx_slope2_pre = (
-            float(df_day.at[i, "ADX15"] - df_day.at[i - 2, "ADX15"]) if i >= 2 else 0.0
-        )
-        ema_gap_atr_pre = (close1 - ema20) / atr1 if atr1 > 0 else 0.0
-
-        # Quality score lower bound (avwap_dist_atr=0 gives floor)
-        if cfg.min_quality_score > 0:
-            q_floor = compute_quality_score_long(
-                adx1, adx_slope2_pre, 0.0, ema_gap_atr_pre, impulse
-            )
-            if q_floor < cfg.min_quality_score:
-                i += 1
-                continue
-
         signal_time = c1["date"]
         high1 = float(c1["high"])
         open1 = float(c1["open"])
