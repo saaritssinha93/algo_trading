@@ -229,3 +229,4 @@ outputs/**
 !backtesting/
 backtesting/**
 !backtesting/eqidv1/**/*.py
+!backtesting/**/*.py
