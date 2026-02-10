@@ -225,8 +225,17 @@ __pycache__
 outputs/**
 !outputs/**/*.csv
 
-# Include backtesting directory but only CSV and py files inside it
+# -----------------------------
+# Allow ONLY eqidv1 python code
+# -----------------------------
 !backtesting/
-backtesting/**
+!backtesting/eqidv1/
+!backtesting/eqidv1/**/
 !backtesting/eqidv1/**/*.py
-!backtesting/**/*.py
+
+# If you also want to include notebooks/docs inside eqidv1, uncomment:
+# !backtesting/eqidv1/**/*.md
+# !backtesting/eqidv1/**/*.ipynb
+# !backtesting/eqidv1/**/*.json
+# !backtesting/eqidv1/**/*.yml
+# !backtesting/eqidv1/**/*.yaml
