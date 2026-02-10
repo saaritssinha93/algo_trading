@@ -1076,6 +1076,49 @@ def _compute_common_features(df: pd.DataFrame, mode: str) -> pd.DataFrame:
 
     return df
 
+def _downcast_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce memory + parquet size by downcasting float/int columns where safe."""
+    out = df.copy()
+    for col in out.columns:
+        if col == "date":
+            continue
+        if pd.api.types.is_float_dtype(out[col]):
+            out[col] = pd.to_numeric(out[col], downcast="float")
+        elif pd.api.types.is_integer_dtype(out[col]):
+            out[col] = pd.to_numeric(out[col], downcast="integer")
+    return out
+
+
+def _indicator_quality_snapshot(df: pd.DataFrame) -> dict[str, float]:
+    """Simple health checks for core indicators consumed by AVWAP strategy."""
+    checks: dict[str, float] = {}
+    total = max(len(df), 1)
+
+    for col in ("ATR", "RSI", "Stoch_%K", "Stoch_%D", "ADX", "EMA_20", "EMA_50"):
+        if col in df.columns:
+            checks[f"{col}_nan_pct"] = float(df[col].isna().sum() * 100.0 / total)
+
+    if "RSI" in df.columns:
+        r = pd.to_numeric(df["RSI"], errors="coerce")
+        checks["RSI_out_of_range_pct"] = float(((r < 0) | (r > 100)).sum() * 100.0 / total)
+
+    if "Stoch_%K" in df.columns:
+        k = pd.to_numeric(df["Stoch_%K"], errors="coerce")
+        checks["StochK_out_of_range_pct"] = float(((k < 0) | (k > 100)).sum() * 100.0 / total)
+
+    return checks
+
+
+def _log_indicator_quality(logger: logging.Logger, ticker: str, mode: str, df: pd.DataFrame) -> None:
+    q = _indicator_quality_snapshot(df)
+    if not q:
+        return
+
+    severe = [k for k, v in q.items() if v > 15.0]
+    if severe:
+        logger.warning("[%s] %s indicator quality warning: %s", mode.upper(), ticker, q)
+
+
 def _safe_mkdir(p: str):
     os.makedirs(p, exist_ok=True)
 
@@ -1183,6 +1226,8 @@ def process_ticker(mode: str, ticker: str, token: int, kite: KiteConnect,
 
     try:
         merged = _compute_common_features(merged, mode)
+        merged = _downcast_numeric_columns(merged)
+        _log_indicator_quality(logger, ticker, mode, merged)
 
         if mode == "daily":
             cutoff_d = daily_cutoff_date_previous(now_ist, holidays) if context.lower() == "previous" \
@@ -1405,7 +1450,7 @@ def parse_args():
                    help="After successful Parquet write, delete legacy CSV outputs (if they exist).")
 
     # ETF-specific reporting default
-    p.add_argument("--report-dir", default="stocks_missing_reports",
+    p.add_argument("--report-dir", default="reports/stocks_missing_reports",
                    help="Directory to write missing-files and missing-rows reports")
     p.add_argument("--print-missing-rows", action="store_true",
                    help="Print a small preview of newly appended rows per ETF")
