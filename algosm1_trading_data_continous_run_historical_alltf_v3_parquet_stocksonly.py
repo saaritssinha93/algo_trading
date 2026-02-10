@@ -731,12 +731,13 @@ def fetch_historical_15min_df(kite, token, start_dt_ist, end_dt_ist, logger, int
 # ========= INDICATORS (unchanged) =========
 
 def calculate_rsi(close, period=14):
+    """Wilder's RSI using EMA smoothing (industry standard, matches strategy code)."""
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-10)
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 def calculate_atr(df, period=14):
@@ -839,19 +840,17 @@ def calculate_mfi(df, period=14):
     return 100 - (100 / (1 + pos_sum / (neg_sum + 1e-10)))
 
 def calculate_obv(df):
-    obv = [0]
-    for i in range(1, len(df)):
-        if df["close"].iloc[i] > df["close"].iloc[i - 1]:
-            obv.append(obv[-1] + df["volume"].iloc[i])
-        elif df["close"].iloc[i] < df["close"].iloc[i - 1]:
-            obv.append(obv[-1] - df["volume"].iloc[i])
-        else:
-            obv.append(obv[-1])
-    return pd.Series(obv, index=df.index)
+    """Vectorized OBV for significantly faster computation on large datasets."""
+    close = df["close"].values
+    volume = df["volume"].values
+    direction = np.sign(np.diff(close, prepend=close[0]))
+    direction[0] = 0  # first bar has no direction
+    return pd.Series(np.cumsum(direction * volume), index=df.index)
 
 def add_standard_indicators(df):
     df["RSI"] = calculate_rsi(df["close"])
     df["ATR"] = calculate_atr(df)
+    df["EMA_20"] = calculate_ema(df["close"], 20)
     df["EMA_50"] = calculate_ema(df["close"], 50)
     df["EMA_200"] = calculate_ema(df["close"], 200)
     df["20_SMA"] = df["close"].rolling(20, min_periods=20).mean()
