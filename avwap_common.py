@@ -105,6 +105,11 @@ class StrategyConfig:
     use_atr_pct_filter: bool = True
     atr_pct_min: float = 0.0020
 
+    # --- Signal quality gate (NEW) ---
+    min_quality_score: float = 0.0        # 0 = disabled; e.g. 0.55 for SHORT
+    min_ema_gap_atr: float = 0.0          # 0 = disabled; min |close-EMA20|/ATR
+    min_signal_volume_factor: float = 0.0  # 0 = disabled; signal vol vs 20-bar avg
+
     # --- AVWAP rules (Option B) ---
     require_avwap_rule: bool = True
     avwap_touch: bool = True
@@ -135,32 +140,39 @@ class StrategyConfig:
 
 
 def default_short_config(**overrides) -> StrategyConfig:
-    """Factory for the SHORT side with typical v11 defaults."""
+    """Factory for the SHORT side with improved v11 defaults."""
     base = dict(
         side="SHORT",
         stop_pct=0.0100,
-        target_pct=0.0100,
-        mod_impulse_min_atr=0.45,
-        rsi_max_short=55.0,
-        stochk_max=75.0,
-        topn_per_day=8,
-        signal_windows=[(dtime(9, 15, 0), dtime(11, 30, 0))],
+        target_pct=0.0120,                # 1.2% target (was 1.0%) — better R:R
+        mod_impulse_min_atr=0.50,          # stronger impulse required (was 0.45)
+        close_near_extreme_max=0.20,       # tighter close-near-low (was 0.25)
+        rsi_max_short=50.0,                # stricter RSI (was 55)
+        stochk_max=70.0,                   # stricter Stoch (was 75)
+        be_trigger_pct=0.0055,             # wider BE trigger (was 0.40%)
+        min_quality_score=0.55,            # filter weak signals
+        min_ema_gap_atr=0.30,              # require meaningful EMA distance
+        min_signal_volume_factor=1.2,      # above-average volume on impulse
+        topn_per_day=20,                   # more selective (was 30)
     )
     base.update(overrides)
     return StrategyConfig(**base)
 
 
 def default_long_config(**overrides) -> StrategyConfig:
-    """Factory for the LONG side with typical v11 defaults."""
+    """Factory for the LONG side with improved v11 defaults."""
     base = dict(
         side="LONG",
         stop_pct=0.0100,
         target_pct=0.0200,
         mod_impulse_min_atr=0.30,
-        rsi_min_long=45.0,
-        stochk_min=25.0,
+        rsi_min_long=50.0,                 # stricter RSI (was 45)
+        stochk_min=30.0,                   # stricter Stoch (was 25)
         stochk_max=95.0,
-        topn_per_day=8,
+        be_trigger_pct=0.0100,             # wider BE trigger (was 0.40%) — 2% target needs room
+        min_quality_score=0.50,            # filter weak signals
+        min_signal_volume_factor=1.2,      # above-average volume on impulse
+        topn_per_day=20,                   # more selective (was 30)
     )
     base.update(overrides)
     return StrategyConfig(**base)
@@ -418,6 +430,13 @@ def prepare_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
         out["ADX15"] = pd.to_numeric(out["ADX"], errors="coerce")
     else:
         out["ADX15"] = compute_adx14(out)
+
+    # Volume rolling average (for signal-volume gate)
+    if "volume" in out.columns:
+        vol = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+        out["VOL_AVG20"] = vol.rolling(20, min_periods=5).mean()
+    else:
+        out["VOL_AVG20"] = np.nan
 
     out["day"] = out["date"].dt.tz_convert(IST).dt.date
     return out

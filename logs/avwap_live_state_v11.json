@@ -4,11 +4,15 @@
       "IRMENERGY|SHORT": 1,
       "PRIMESECU|SHORT": 1,
       "SOLARA|SHORT": 1
+    },
+    "2026-02-10": {
+      "VLSFINANCE|LONG": 1
     }
   },
   "last_signal": {
     "IRMENERGY|SHORT": "2026-02-02",
     "PRIMESECU|SHORT": "2026-02-02",
-    "SOLARA|SHORT": "2026-02-02"
+    "SOLARA|SHORT": "2026-02-02",
+    "VLSFINANCE|LONG": "2026-02-10"
   }
 }
