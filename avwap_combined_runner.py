@@ -42,7 +42,6 @@ from avwap_v11_refactored.avwap_common import (
     IST,
     StrategyConfig,
     Trade,
-    BacktestMetrics,
     default_short_config,
     default_long_config,
     now_ist,
@@ -347,82 +346,6 @@ def _print_notional_pnl(combined: pd.DataFrame) -> None:
     print("=" * 61)
 
 
-def _write_summary_text(
-    out_path: Path,
-    short_metrics: BacktestMetrics,
-    long_metrics: BacktestMetrics,
-    combined_metrics: BacktestMetrics,
-    combined_df: pd.DataFrame,
-) -> None:
-    pnl_short = float(combined_df.loc[combined_df["side"].eq("SHORT"), "pnl_rs"].sum()) if "pnl_rs" in combined_df.columns else 0.0
-    pnl_long = float(combined_df.loc[combined_df["side"].eq("LONG"), "pnl_rs"].sum()) if "pnl_rs" in combined_df.columns else 0.0
-    pnl_all = float(combined_df["pnl_rs"].sum()) if "pnl_rs" in combined_df.columns else 0.0
-
-    lines = [
-        "AVWAP v11 COMBINED SUMMARY",
-        "=" * 80,
-        f"SHORT trades: {short_metrics.total_trades} | PF: {short_metrics.profit_factor:.3f} | Avg net pnl %: {short_metrics.avg_pnl_pct:.4f}",
-        f"LONG trades: {long_metrics.total_trades} | PF: {long_metrics.profit_factor:.3f} | Avg net pnl %: {long_metrics.avg_pnl_pct:.4f}",
-        f"COMBINED trades: {combined_metrics.total_trades} | PF: {combined_metrics.profit_factor:.3f} | Avg net pnl %: {combined_metrics.avg_pnl_pct:.4f}",
-        "-" * 80,
-        f"SHORT notional P&L: Rs.{pnl_short:,.2f}",
-        f"LONG  notional P&L: Rs.{pnl_long:,.2f}",
-        f"TOTAL notional P&L: Rs.{pnl_all:,.2f}",
-    ]
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _save_visual_reports(combined: pd.DataFrame, reports_dir: Path, ts: str) -> List[Path]:
-    """Save chart artifacts. Returns list of generated files."""
-    artifacts: List[Path] = []
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        print("[WARN] matplotlib not installed. Skipping graph generation.")
-        return artifacts
-
-    if combined.empty:
-        return artifacts
-
-    d = combined.copy()
-    d["trade_date"] = pd.to_datetime(d["trade_date"], errors="coerce")
-    d = d.dropna(subset=["trade_date"])
-    if d.empty:
-        return artifacts
-
-    if "pnl_pct" in d.columns:
-        d["pnl_pct"] = pd.to_numeric(d["pnl_pct"], errors="coerce").fillna(0.0)
-        daily = d.groupby("trade_date", as_index=True)["pnl_pct"].sum().sort_index()
-        equity = daily.cumsum()
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(equity.index, equity.values, linewidth=1.8)
-        ax.set_title("AVWAP Combined Cumulative Net PnL (%)")
-        ax.set_xlabel("Trade date")
-        ax.set_ylabel("Cumulative net PnL %")
-        ax.grid(alpha=0.3)
-        eq_path = reports_dir / f"avwap_equity_curve_{ts}.png"
-        fig.tight_layout()
-        fig.savefig(eq_path, dpi=150)
-        plt.close(fig)
-        artifacts.append(eq_path)
-
-    side_counts = d.groupby(["trade_date", "side"]).size().unstack(fill_value=0).sort_index()
-    if not side_counts.empty:
-        fig, ax = plt.subplots(figsize=(12, 6))
-        side_counts.plot(kind="bar", stacked=True, ax=ax, width=0.85)
-        ax.set_title("Daily Trade Count by Side")
-        ax.set_xlabel("Trade date")
-        ax.set_ylabel("Trades")
-        ax.grid(axis="y", alpha=0.25)
-        cnt_path = reports_dir / f"avwap_daily_tradecount_{ts}.png"
-        fig.tight_layout()
-        fig.savefig(cnt_path, dpi=150)
-        plt.close(fig)
-        artifacts.append(cnt_path)
-
-    return artifacts
-
 
 # ===========================================================================
 # MAIN
@@ -478,9 +401,6 @@ def main() -> None:
     ts = now_ist().strftime("%Y%m%d_%H%M%S")
     out_csv = reports_dir / f"avwap_longshort_trades_ALL_DAYS_{ts}.csv"
     combined.to_csv(out_csv, index=False)
-    out_txt = reports_dir / f"avwap_longshort_summary_ALL_DAYS_{ts}.txt"
-    _write_summary_text(out_txt, short_metrics, long_metrics, combined_metrics, combined)
-    chart_files = _save_visual_reports(combined, reports_dir, ts)
 
     # --- Sample output ---
     cols = [
@@ -495,9 +415,6 @@ def main() -> None:
     print("\n=============== SAMPLE (first 30 rows) ===============")
     print(combined.head(30)[cols].to_string(index=False))
     print(f"\n[FILE SAVED] {out_csv}")
-    print(f"[FILE SAVED] {out_txt}")
-    for f in chart_files:
-        print(f"[FILE SAVED] {f}")
     print("[DONE]")
 
 
