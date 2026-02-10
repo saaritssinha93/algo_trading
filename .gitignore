@@ -220,7 +220,13 @@ data_cache
 __pycache__
 
 
-# Include reports directory but only CSV files inside it
-!reports/
-reports/**
-!reports/**/*.csv
+# Include outputs directory but only CSV files inside it
+!outputs/
+outputs/**
+!outputs/**/*.csv
+
+# Include backtesting directory but only CSV and py files inside it
+!backtesting/
+backtesting/**
+!backtesting/**/*.csv
+!backtesting/**/*.py
