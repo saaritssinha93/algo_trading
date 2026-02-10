@@ -79,7 +79,7 @@ MAX_WORKERS = 4
 # OUTPUT PATHS
 # ==========================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent
-REPORTS_DIR = PROJECT_ROOT / "reports"
+REPORTS_DIR = PROJECT_ROOT / "outputs"
 
 
 # ===========================================================================
