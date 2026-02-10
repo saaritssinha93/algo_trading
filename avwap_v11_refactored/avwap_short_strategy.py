@@ -281,6 +281,24 @@ def scan_one_day(
         ema_gap_atr = (ema20 - close1) / atr1
         quality = compute_quality_score_short(adx1, avwap_dist_atr, ema_gap_atr, impulse)
 
+        # --- NEW: Quality score gate ---
+        if cfg.min_quality_score > 0 and quality < cfg.min_quality_score:
+            i += 1
+            continue
+
+        # --- NEW: Minimum EMA gap gate (trend strength) ---
+        if cfg.min_ema_gap_atr > 0 and abs(ema_gap_atr) < cfg.min_ema_gap_atr:
+            i += 1
+            continue
+
+        # --- NEW: Volume gate (signal bar vs rolling average) ---
+        if cfg.min_signal_volume_factor > 0 and "VOL_AVG20" in df_day.columns:
+            sig_vol = float(c1.get("volume", 0.0)) if np.isfinite(c1.get("volume", 0.0)) else 0.0
+            avg_vol = float(c1.get("VOL_AVG20", 0.0)) if np.isfinite(c1.get("VOL_AVG20", 0.0)) else 0.0
+            if avg_vol > 0 and sig_vol < cfg.min_signal_volume_factor * avg_vol:
+                i += 1
+                continue
+
         low1 = float(c1["low"])
 
         def _bars_left_ok(eidx: int) -> bool:
