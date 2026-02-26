@@ -8,6 +8,7 @@ cd /d %ROOT%
 echo ================================ >> %LOG%
 echo [%DATE% %TIME%] START EOD 1540 >> %LOG%
 
-python etf_eod_daily_weekly_scheduler_for_daily_1540_update.py >> %LOG% 2>&1
+set PYTHONPATH=%ROOT%;%PYTHONPATH%
+python scripts\schedulers\etf_eod_daily_weekly_scheduler_for_daily_1540_update.py >> %LOG% 2>&1
 
 echo [%DATE% %TIME%] END EOD 1540 >> %LOG%

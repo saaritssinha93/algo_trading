@@ -8,6 +8,7 @@ cd /d %ROOT%
 echo ================================ >> %LOG%
 echo [%DATE% %TIME%] START live signals >> %LOG%
 
-python etf_live_trading_signal_15m_v7_parquet.py >> %LOG% 2>&1
+set PYTHONPATH=%ROOT%;%PYTHONPATH%
+python scripts\live_trading\etf_live_trading_signal_15m_v7_parquet.py >> %LOG% 2>&1
 
 echo [%DATE% %TIME%] END live signals >> %LOG%

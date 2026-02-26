@@ -8,6 +8,7 @@ cd /d %ROOT%
 echo ================================ >> %LOG%
 echo [%DATE% %TIME%] START auth >> %LOG%
 
-python algosm1_authentication.py >> %LOG% 2>&1
+set PYTHONPATH=%ROOT%;%PYTHONPATH%
+python scripts\auth\algosm1_authentication.py >> %LOG% 2>&1
 
 echo [%DATE% %TIME%] END auth >> %LOG%

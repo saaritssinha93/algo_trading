@@ -8,6 +8,7 @@ cd /d %ROOT%
 echo ================================ >> %LOG%
 echo [%DATE% %TIME%] START eqidv1 EOD 1540 >> %LOG%
 
-python eqidv1_eod_scheduler_for_1540_update.py >> %LOG% 2>&1
+set PYTHONPATH=%ROOT%;%PYTHONPATH%
+python scripts\schedulers\eqidv1_eod_scheduler_for_1540_update.py >> %LOG% 2>&1
 
 echo [%DATE% %TIME%] END eqidv1 EOD 1540 >> %LOG%
